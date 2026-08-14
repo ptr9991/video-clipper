@@ -54,7 +54,6 @@ def create_temp_file(suffix: str = "", prefix: str = "clip_") -> Path:
     from src.config import TEMP_DIR
 
     fd, name = tempfile.mkstemp(suffix=suffix, prefix=prefix, dir=str(TEMP_DIR))
-    # Close the fd; we only need the path
     import os
 
     os.close(fd)
@@ -76,31 +75,82 @@ def cleanup_file(path: Optional[Path]) -> None:
 def extract_json_from_text(text: str) -> Optional[dict[str, Any]]:
     """
     Try to extract a JSON object from an LLM response that may contain
-    markdown fences or extra prose.
+    markdown fences, trailing commas, or extra prose.
     """
+    if not text or not text.strip():
+        return None
+
     text = text.strip()
 
     # Direct parse
     try:
-        return json.loads(text)
+        obj = json.loads(text)
+        if isinstance(obj, dict):
+            return obj
     except json.JSONDecodeError:
         pass
 
-    # Markdown code block
-    match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL)
+    # Markdown code block ```json ... ``` or ``` ... ```
+    match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL | re.IGNORECASE)
     if match:
         try:
-            return json.loads(match.group(1))
+            obj = json.loads(match.group(1))
+            if isinstance(obj, dict):
+                return obj
         except json.JSONDecodeError:
             pass
 
-    # First { ... } occurrence
-    match = re.search(r"\{.*\}", text, re.DOTALL)
-    if match:
-        try:
-            return json.loads(match.group(0))
-        except json.JSONDecodeError:
-            pass
+    # First balanced { ... } occurrence
+    start = text.find("{")
+    if start >= 0:
+        depth = 0
+        in_string = False
+        escape = False
+        for i in range(start, len(text)):
+            ch = text[i]
+            if in_string:
+                if escape:
+                    escape = False
+                elif ch == "\\":
+                    escape = True
+                elif ch == '"':
+                    in_string = False
+                continue
+            if ch == '"':
+                in_string = True
+            elif ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    candidate = text[start : i + 1]
+                    # Fix common LLM mistakes: trailing commas
+                    cleaned = re.sub(r",\s*([}\]])", r"\1", candidate)
+                    try:
+                        obj = json.loads(cleaned)
+                        if isinstance(obj, dict):
+                            return obj
+                    except json.JSONDecodeError:
+                        break
+
+    # Last resort: find start/end numbers with regex
+    start_m = re.search(r'"start"\s*:\s*([0-9]+(?:\.[0-9]+)?)', text)
+    end_m = re.search(r'"end"\s*:\s*([0-9]+(?:\.[0-9]+)?)', text)
+    if start_m and end_m:
+        result: dict[str, Any] = {
+            "start": float(start_m.group(1)),
+            "end": float(end_m.group(1)),
+        }
+        reason_m = re.search(r'"reason"\s*:\s*"((?:\\.|[^"\\])*)"', text)
+        hook_m = re.search(r'"hook"\s*:\s*"((?:\\.|[^"\\])*)"', text)
+        score_m = re.search(r'"score"\s*:\s*([0-9]+)', text)
+        if reason_m:
+            result["reason"] = reason_m.group(1)
+        if hook_m:
+            result["hook"] = hook_m.group(1)
+        if score_m:
+            result["score"] = int(score_m.group(1))
+        return result
 
     return None
 
