@@ -14,6 +14,9 @@ from src.utils import cleanup_file, create_temp_file, validate_timestamps
 
 log = logging.getLogger("video_clipper.video")
 
+# Groq Whisper practical upload limit (leave headroom below official caps)
+GROQ_SAFE_UPLOAD_MB = 20.0
+
 
 @dataclass
 class VideoInfo:
@@ -146,15 +149,20 @@ def extract_audio(
     output_path: Optional[Path] = None,
     sample_rate: int = 16000,
     channels: int = 1,
+    bitrate: str = "48k",
 ) -> Path:
     """
-    Extract mono 16 kHz WAV audio optimised for Whisper transcription.
+    Extract mono compressed MP3 audio optimised for Whisper transcription.
+
+    MP3 @ 48 kbps mono is ~0.36 MB/min — a 1-hour video stays ~22 MB,
+    under Groq's practical upload limit. WAV 16 kHz mono is ~1.9 MB/min
+    and easily exceeds the limit on long videos (HTTP 413).
 
     Uses subprocess with a list of arguments (no shell=True).
     """
     ffmpeg = get_ffmpeg_path()
     if output_path is None:
-        output_path = create_temp_file(suffix=".wav", prefix="audio_")
+        output_path = create_temp_file(suffix=".mp3", prefix="audio_")
 
     cmd = [
         ffmpeg,
@@ -167,11 +175,13 @@ def extract_audio(
         "-ar",
         str(sample_rate),
         "-c:a",
-        "pcm_s16le",
+        "libmp3lame",
+        "-b:a",
+        bitrate,
         str(output_path),
     ]
 
-    log.info("Extracting audio: %s", " ".join(cmd))
+    log.info("Extracting audio (MP3 %s): %s", bitrate, " ".join(cmd))
     try:
         result = subprocess.run(
             cmd,
@@ -194,8 +204,57 @@ def extract_audio(
     if not output_path.exists() or output_path.stat().st_size == 0:
         raise RuntimeError("Arquivo de áudio gerado está vazio ou não foi criado.")
 
-    log.info("Audio extracted: %s (%.1f KB)", output_path, output_path.stat().st_size / 1024)
+    size_mb = output_path.stat().st_size / (1024 * 1024)
+    log.info("Audio extracted: %s (%.1f MB)", output_path, size_mb)
     return output_path
+
+
+def split_audio_chunks(
+    audio_path: Path,
+    chunk_duration_sec: float = 600.0,
+) -> list[Path]:
+    """
+    Split a long audio file into fixed-duration chunks for API upload.
+
+    Returns list of chunk file paths (caller must clean them up).
+    """
+    ffmpeg = get_ffmpeg_path()
+    out_dir = audio_path.parent
+    pattern = str(out_dir / f"{audio_path.stem}_chunk_%03d{audio_path.suffix}")
+
+    cmd = [
+        ffmpeg,
+        "-y",
+        "-i",
+        str(audio_path),
+        "-f",
+        "segment",
+        "-segment_time",
+        str(int(chunk_duration_sec)),
+        "-c",
+        "copy",
+        pattern,
+    ]
+
+    log.info("Splitting audio into ~%.0fs chunks", chunk_duration_sec)
+    try:
+        subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=300,
+        )
+    except subprocess.CalledProcessError as exc:
+        raise RuntimeError(
+            f"Falha ao dividir áudio: {exc.stderr[:300] if exc.stderr else str(exc)}"
+        ) from exc
+
+    chunks = sorted(out_dir.glob(f"{audio_path.stem}_chunk_*{audio_path.suffix}"))
+    if not chunks:
+        raise RuntimeError("Nenhum chunk de áudio foi gerado.")
+    log.info("Created %d audio chunks", len(chunks))
+    return chunks
 
 
 def cut_video(
