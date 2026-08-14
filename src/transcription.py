@@ -16,8 +16,10 @@ from src.video_processor import GROQ_SAFE_UPLOAD_MB, extract_audio, split_audio_
 
 log = logging.getLogger("video_clipper.transcription")
 
-# Chunk length when the compressed file is still too large
-CHUNK_DURATION_SEC = 600.0  # 10 minutes
+# Always split into small pieces for reliability on free-tier limits
+CHUNK_DURATION_SEC = 300.0  # 5 minutes
+# Force chunking above this size (MB)
+FORCE_CHUNK_MB = 8.0
 
 
 @dataclass
@@ -83,16 +85,22 @@ def _transcribe_single_file(
     """Send one audio file to Groq Whisper."""
     size_mb = audio_path.stat().st_size / (1024 * 1024)
     log.info(
-        "Transcribing chunk: %s (%.1f MB, offset=%.1fs)",
+        "Transcribing chunk: %s (%.2f MB, offset=%.1fs)",
         audio_path.name,
         size_mb,
         time_offset,
     )
 
+    if size_mb > GROQ_SAFE_UPLOAD_MB:
+        raise RuntimeError(
+            f"Chunk ainda grande demais ({size_mb:.1f} MB). "
+            f"Limite seguro: {GROQ_SAFE_UPLOAD_MB:.0f} MB."
+        )
+
     try:
         with audio_path.open("rb") as audio_file:
             kwargs: dict[str, Any] = {
-                "file": (audio_path.name, audio_file),
+                "file": (audio_path.name, audio_file.read()),
                 "model": model,
                 "response_format": "verbose_json",
                 "timestamp_granularities": ["segment"],
@@ -135,19 +143,18 @@ def transcribe_audio(
     """
     Transcribe an audio file using Groq's Whisper endpoint.
 
-    - Uses response_format="verbose_json" for segment timestamps.
-    - If the file is larger than GROQ_SAFE_UPLOAD_MB, splits into chunks,
-      transcribes each, and stitches timestamps together.
+    Files above FORCE_CHUNK_MB are split into 5-minute pieces, transcribed
+    separately, and timestamps are stitched back together.
     """
     if not audio_path.exists():
         raise FileNotFoundError(f"Arquivo de áudio não encontrado: {audio_path}")
 
     size_mb = audio_path.stat().st_size / (1024 * 1024)
     client = get_client()
-    log.info("Starting transcription with model=%s, file=%.1f MB", model, size_mb)
+    log.info("Starting transcription with model=%s, file=%.2f MB", model, size_mb)
 
-    # Fast path: small enough to upload in one request
-    if size_mb <= GROQ_SAFE_UPLOAD_MB:
+    # Fast path for short/small audio
+    if size_mb <= FORCE_CHUNK_MB:
         result = _transcribe_single_file(client, audio_path, model, language)
         log.info(
             "Transcription finished: %d chars, %d segments, duration=%.1fs",
@@ -157,11 +164,12 @@ def transcribe_audio(
         )
         return result
 
-    # Slow path: chunk large files
+    # Chunk path — used for longer videos
     log.info(
-        "Audio is %.1f MB (> %.0f MB limit). Splitting into chunks…",
+        "Audio is %.2f MB (> %.0f MB). Splitting into %.0fs chunks…",
         size_mb,
-        GROQ_SAFE_UPLOAD_MB,
+        FORCE_CHUNK_MB,
+        CHUNK_DURATION_SEC,
     )
     chunks = split_audio_chunks(audio_path, chunk_duration_sec=CHUNK_DURATION_SEC)
     all_segments: list[Segment] = []
@@ -206,7 +214,7 @@ def transcribe_video(
     language: Optional[str] = None,
 ) -> tuple[TranscriptionResult, Path]:
     """
-    Convenience: extract compressed audio then transcribe.
+    Extract compressed audio then transcribe.
     Returns (result, audio_path) so the caller can clean up the audio file.
     """
     audio_path = extract_audio(video_path)

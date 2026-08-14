@@ -10,12 +10,12 @@ from pathlib import Path
 from typing import Optional
 
 from src.config import get_ffmpeg_path, logger
-from src.utils import cleanup_file, create_temp_file, validate_timestamps
+from src.utils import create_temp_file, validate_timestamps
 
 log = logging.getLogger("video_clipper.video")
 
-# Groq Whisper practical upload limit (leave headroom below official caps)
-GROQ_SAFE_UPLOAD_MB = 20.0
+# Groq Whisper practical upload limit (free tier can be tighter than 100 MB)
+GROQ_SAFE_UPLOAD_MB = 15.0
 
 
 @dataclass
@@ -40,14 +40,10 @@ class VideoInfo:
 
 
 def get_video_info(video_path: Path) -> VideoInfo:
-    """
-    Extract basic metadata using ffprobe (ships with FFmpeg).
-    """
+    """Extract basic metadata using ffprobe (ships with FFmpeg)."""
     ffmpeg = get_ffmpeg_path()
-    # ffprobe is usually next to ffmpeg
     ffprobe = ffmpeg.replace("ffmpeg", "ffprobe")
     if not Path(ffprobe).exists():
-        # Fallback: try system ffprobe
         import shutil
 
         ffprobe = shutil.which("ffprobe") or "ffprobe"
@@ -74,7 +70,6 @@ def get_video_info(video_path: Path) -> VideoInfo:
         data = json.loads(result.stdout)
     except (subprocess.CalledProcessError, json.JSONDecodeError, FileNotFoundError) as exc:
         log.error("ffprobe failed: %s", exc)
-        # Minimal fallback using ffmpeg itself
         return _fallback_info(video_path)
 
     duration = 0.0
@@ -91,7 +86,6 @@ def get_video_info(video_path: Path) -> VideoInfo:
             width = int(stream.get("width", 0))
             height = int(stream.get("height", 0))
             codec = stream.get("codec_name", "")
-            # fps can be "30/1" or "29.97"
             avg_fps = stream.get("avg_frame_rate", "0/1")
             try:
                 if "/" in avg_fps:
@@ -119,12 +113,10 @@ def get_video_info(video_path: Path) -> VideoInfo:
 def _fallback_info(video_path: Path) -> VideoInfo:
     """Very basic fallback when ffprobe is unavailable."""
     size_bytes = video_path.stat().st_size
-    # Try to get duration via ffmpeg -i (parse stderr)
     ffmpeg = get_ffmpeg_path()
     cmd = [ffmpeg, "-i", str(video_path)]
     try:
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
-        # Duration is in stderr: Duration: 00:01:23.45
         import re
 
         match = re.search(r"Duration:\s*(\d+):(\d+):(\d+\.\d+)", result.stderr)
@@ -149,73 +141,75 @@ def extract_audio(
     output_path: Optional[Path] = None,
     sample_rate: int = 16000,
     channels: int = 1,
-    bitrate: str = "48k",
+    bitrate: str = "32k",
 ) -> Path:
     """
-    Extract mono compressed MP3 audio optimised for Whisper transcription.
+    Extract mono compressed MP3 audio optimised for Whisper.
 
-    MP3 @ 48 kbps mono is ~0.36 MB/min — a 1-hour video stays ~22 MB,
-    under Groq's practical upload limit. WAV 16 kHz mono is ~1.9 MB/min
-    and easily exceeds the limit on long videos (HTTP 413).
-
-    Uses subprocess with a list of arguments (no shell=True).
+    32 kbps mono ≈ 0.24 MB/min → 1 hour ≈ 14 MB (under Groq limits).
+    Falls back to AAC if libmp3lame is unavailable.
     """
     ffmpeg = get_ffmpeg_path()
     if output_path is None:
         output_path = create_temp_file(suffix=".mp3", prefix="audio_")
 
-    cmd = [
-        ffmpeg,
-        "-y",  # overwrite
-        "-i",
-        str(video_path),
-        "-vn",  # no video
-        "-ac",
-        str(channels),
-        "-ar",
-        str(sample_rate),
-        "-c:a",
-        "libmp3lame",
-        "-b:a",
-        bitrate,
-        str(output_path),
+    # Prefer MP3; fall back to AAC (.m4a) if lame is missing
+    attempts = [
+        (
+            output_path if output_path.suffix.lower() == ".mp3" else output_path.with_suffix(".mp3"),
+            ["-c:a", "libmp3lame", "-b:a", bitrate],
+        ),
+        (
+            output_path.with_suffix(".m4a"),
+            ["-c:a", "aac", "-b:a", bitrate],
+        ),
     ]
 
-    log.info("Extracting audio (MP3 %s): %s", bitrate, " ".join(cmd))
-    try:
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            check=True,
-            timeout=300,
-        )
-        log.debug("FFmpeg stdout: %s", result.stdout)
-        if result.stderr:
-            log.debug("FFmpeg stderr: %s", result.stderr)
-    except subprocess.CalledProcessError as exc:
-        log.error("Audio extraction failed: %s", exc.stderr)
-        raise RuntimeError(
-            f"Falha ao extrair áudio com FFmpeg: {exc.stderr[:300] if exc.stderr else str(exc)}"
-        ) from exc
-    except subprocess.TimeoutExpired:
-        raise RuntimeError("Timeout ao extrair áudio (vídeo muito longo?).") from None
+    last_error = ""
+    for out, codec_args in attempts:
+        cmd = [
+            ffmpeg,
+            "-y",
+            "-i",
+            str(video_path),
+            "-vn",
+            "-ac",
+            str(channels),
+            "-ar",
+            str(sample_rate),
+            *codec_args,
+            str(out),
+        ]
+        log.info("Extracting audio: %s", " ".join(cmd))
+        try:
+            subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                check=True,
+                timeout=300,
+            )
+            if out.exists() and out.stat().st_size > 0:
+                size_mb = out.stat().st_size / (1024 * 1024)
+                log.info("Audio extracted: %s (%.2f MB)", out, size_mb)
+                return out
+        except subprocess.CalledProcessError as exc:
+            last_error = exc.stderr[:400] if exc.stderr else str(exc)
+            log.warning("Audio extract attempt failed: %s", last_error)
+        except subprocess.TimeoutExpired:
+            raise RuntimeError("Timeout ao extrair áudio (vídeo muito longo?).") from None
 
-    if not output_path.exists() or output_path.stat().st_size == 0:
-        raise RuntimeError("Arquivo de áudio gerado está vazio ou não foi criado.")
-
-    size_mb = output_path.stat().st_size / (1024 * 1024)
-    log.info("Audio extracted: %s (%.1f MB)", output_path, size_mb)
-    return output_path
+    raise RuntimeError(
+        f"Falha ao extrair áudio com FFmpeg: {last_error or 'codec de áudio indisponível'}"
+    )
 
 
 def split_audio_chunks(
     audio_path: Path,
-    chunk_duration_sec: float = 600.0,
+    chunk_duration_sec: float = 300.0,
 ) -> list[Path]:
     """
     Split a long audio file into fixed-duration chunks for API upload.
-
     Returns list of chunk file paths (caller must clean them up).
     """
     ffmpeg = get_ffmpeg_path()
@@ -233,6 +227,8 @@ def split_audio_chunks(
         str(int(chunk_duration_sec)),
         "-c",
         "copy",
+        "-reset_timestamps",
+        "1",
         pattern,
     ]
 
@@ -267,18 +263,14 @@ def cut_video(
     """
     Cut a segment from the video.
 
-    mode="fast"  → stream copy (-c copy) – default, very fast, keyframe aligned
-    mode="precise" → re-encode (libx264) – slower, frame-accurate
-
-    Arguments are always passed as a list to subprocess (never shell=True).
+    mode="fast"  → stream copy (-c copy)
+    mode="precise" → re-encode (libx264)
     """
     ffmpeg = get_ffmpeg_path()
-    start, end = validate_timestamps(start, end, video_duration=1e9)  # safety
+    start, end = validate_timestamps(start, end, video_duration=1e9)
     duration = end - start
 
     if mode == "fast":
-        # Place -ss before -i for fast seek (less accurate but instant)
-        # -c copy avoids re-encoding
         cmd = [
             ffmpeg,
             "-y",
@@ -295,7 +287,6 @@ def cut_video(
             str(output_path),
         ]
     else:
-        # Accurate mode: -ss after -i + re-encode
         cmd = [
             ffmpeg,
             "-y",
@@ -352,9 +343,7 @@ def build_cut_command(
     output_path: str,
     mode: str = "fast",
 ) -> list[str]:
-    """
-    Pure function that builds the argument list (useful for unit tests).
-    """
+    """Pure function that builds the argument list (useful for unit tests)."""
     if mode == "fast":
         return [
             ffmpeg_path,
