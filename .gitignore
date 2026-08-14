@@ -1,4 +1,4 @@
-# Environment
+# Environment / secrets
 .env
 .venv/
 venv/
@@ -15,13 +15,15 @@ build/
 .mypy_cache/
 .ruff_cache/
 
-# Project runtime
+# Project runtime (generated)
 temp/*
 !temp/.gitkeep
 output/*
 !output/.gitkeep
+portable/
+runtime/
 
-# Media (never commit videos)
+# Media (never commit)
 *.mp4
 *.mov
 *.mkv
@@ -39,3 +41,6 @@ Thumbs.db
 
 # Logs
 *.log
+
+# Local user settings (API key lives in AppData, never here)
+settings.json

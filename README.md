@@ -1,252 +1,153 @@
-# AI Video Clipper Local
+# Video Clipper
 
-Aplicação **100% local** que transforma vídeos longos em clipes curtos de 30–50 segundos usando:
+Transforme vídeos longos em clipes curtos de 30–50 segundos com IA.
 
-- **Streamlit** – interface web local
-- **FFmpeg** – extração de áudio e corte de vídeo (processamento local)
-- **Groq API** – apenas para transcrição (Whisper) e análise textual do melhor trecho
-
-O vídeo original **nunca** sai da sua máquina. Somente o áudio otimizado é enviado à API da Groq.
+**Todo o processamento de vídeo é local.** Só o áudio é enviado à API da Groq para transcrição e análise.
 
 ---
 
-## Requisitos
+## Para usuário normal (Windows)
 
-| Componente       | Versão / Observação                          |
-|------------------|----------------------------------------------|
-| Python           | 3.10 ou superior                             |
-| FFmpeg           | Instalado no sistema e disponível no PATH    |
-| Conta Groq       | Chave de API gratuita em https://console.groq.com |
-| Sistema operacional | Windows 10/11, macOS ou Linux             |
+Você **não precisa** instalar Python, FFmpeg, Git nem abrir o terminal.
+
+### 1. Baixe o instalador
+
+Vá em **[Releases](https://github.com/ptr9991/video-clipper/releases)** e baixe o arquivo:
+
+**`VideoClipperSetup.exe`**
+
+(Se ainda não houver release, o instalador também aparece como *Artifact* na aba Actions após um build bem-sucedido.)
+
+### 2. Instale
+
+1. Clique duas vezes em `VideoClipperSetup.exe`
+2. Siga as telas (pode deixar as opções padrão)
+3. Marque “Criar atalho na Área de Trabalho” se quiser
+4. Clique em Instalar
+
+### 3. Abra o Video Clipper
+
+Clique no atalho **Video Clipper**.
+
+Na primeira vez aparecerá uma janela pedindo a **Groq API Key**:
+
+1. Crie uma chave grátis em https://console.groq.com/keys
+2. Cole a chave na janela
+3. (Opcional) clique em **Testar conexão**
+4. Clique em **Continuar**
+
+O navegador abrirá automaticamente com o Video Clipper.
+
+### 4. Use
+
+1. Faça upload de um vídeo (MP4, MOV, MKV…)
+2. Clique em **Encontrar melhor clipe com IA**
+3. Ajuste os tempos se quiser
+4. Clique em **Gerar clipe** e baixe o MP4
+
+Pronto. Nenhuma outra configuração é necessária.
 
 ---
 
-## Instalação
+## Para desenvolvedores
 
-### 1. Clone o repositório
+### Arquitetura
+
+```
+video-clipper/
+├── app.py                      # Interface Streamlit
+├── requirements.txt
+├── src/                        # Lógica (transcrição, análise, FFmpeg)
+├── scripts/
+│   ├── launcher.py             # Launcher Windows (GUI de API key + Streamlit)
+│   ├── prepare_portable.ps1    # Monta a pasta portable (Python + FFmpeg + app)
+│   └── VideoClipper.bat        # Atalho de desenvolvimento
+├── installer/
+│   └── VideoClipper.iss        # Script Inno Setup → VideoClipperSetup.exe
+├── tests/
+└── .github/workflows/
+    └── build-windows-installer.yml
+```
+
+### Como o instalador funciona
+
+1. **GitHub Actions** (Windows) roda os testes.
+2. O script `prepare_portable.ps1`:
+   - Baixa o **Python embeddable oficial** (python.org)
+   - Instala `pip` + dependências do `requirements.txt`
+   - Baixa **FFmpeg essentials** de https://www.gyan.dev/ffmpeg/builds/ (fonte linkada pelo site oficial do FFmpeg)
+   - Copia o código do app + cria `VideoClipper.bat`
+3. **Inno Setup** empacota tudo em `VideoClipperSetup.exe`.
+4. O instalador grava em `%LOCALAPPDATA%\VideoClipper` (não precisa de administrador).
+5. O atalho chama o launcher, que:
+   - Pede a API key (salva só neste PC, em `%LOCALAPPDATA%\VideoClipper\settings.json`)
+   - Aponta para o FFmpeg embutido
+   - Sobe o Streamlit sem janela de terminal
+   - Abre o navegador automaticamente
+
+### Fontes oficiais dos downloads (build)
+
+| Componente | Fonte |
+|------------|--------|
+| Python embeddable | https://www.python.org/ftp/python/ |
+| get-pip.py | https://bootstrap.pypa.io/get-pip.py |
+| FFmpeg essentials | https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip |
+| Inno Setup | https://jrsoftware.org/isinfo.php (via Chocolatey no CI) |
+
+Nenhum executável de site desconhecido é baixado.
+
+### Rodar a partir do código-fonte (desenvolvimento)
 
 ```bash
 git clone https://github.com/ptr9991/video-clipper.git
 cd video-clipper
-```
-
-### 2. Crie e ative um ambiente virtual
-
-**Windows (CMD)**
-```cmd
 python -m venv .venv
-.venv\Scripts\activate
-```
-
-**Windows (PowerShell)**
-```powershell
-python -m venv .venv
-.venv\Scripts\Activate.ps1
-```
-
-**macOS / Linux**
-```bash
-python3 -m venv .venv
-source .venv/bin/activate
-```
-
-### 3. Instale as dependências Python
-
-```bash
+# Windows: .venv\Scripts\activate
 pip install -r requirements.txt
-```
-
-> **Importante:** FFmpeg **não** é um pacote Python. Ele deve ser instalado no sistema operacional.
-
-### 4. Configure a chave da Groq
-
-```bash
-cp .env.example .env
-```
-
-Edite `.env` e coloque sua chave:
-
-```
-GROQ_API_KEY=gsk_xxxxxxxxxxxxxxxxxxxxxxxx
-```
-
-Alternativas (sem arquivo `.env`):
-
-**Windows PowerShell**
-```powershell
-$env:GROQ_API_KEY="sua_chave"
-```
-
-**Windows CMD**
-```cmd
-set GROQ_API_KEY=sua_chave
-```
-
-**macOS / Linux**
-```bash
-export GROQ_API_KEY="sua_chave"
-```
-
-### 5. Instale o FFmpeg
-
-#### Windows
-
-1. Baixe o build em https://www.gyan.dev/ffmpeg/builds/ (versão `ffmpeg-release-essentials.zip`)
-2. Extraia para uma pasta, por exemplo `C:\ffmpeg`
-3. Adicione `C:\ffmpeg\bin` ao PATH do sistema
-4. Abra um **novo** terminal e teste:
-
-```cmd
-ffmpeg -version
-```
-
-Ou use o gerenciador de pacotes:
-
-```powershell
-winget install ffmpeg
-```
-
-#### macOS
-
-Com Homebrew (recomendado):
-
-```bash
-brew install ffmpeg
-```
-
-#### Linux (Debian/Ubuntu)
-
-```bash
-sudo apt update
-sudo apt install ffmpeg
-```
-
-#### Verificação
-
-```bash
-ffmpeg -version
-ffprobe -version
-```
-
-Se o FFmpeg estiver em um local customizado, defina:
-
-```
-FFMPEG_PATH=/caminho/completo/para/ffmpeg
-```
-
----
-
-## Executar a aplicação
-
-```bash
+# FFmpeg precisa estar no PATH ou defina FFMPEG_PATH
 streamlit run app.py
+# ou: python scripts/launcher.py
 ```
 
-O navegador abrirá automaticamente em `http://localhost:8501`.
-
----
-
-## Fluxo de uso
-
-1. Faça upload de um vídeo (MP4, MOV, MKV ou WEBM).
-2. Visualize o preview e os metadados (duração, resolução, tamanho).
-3. Clique em **“Encontrar melhor clipe com IA”**.
-4. Aguarde:
-   - Extração local do áudio (FFmpeg)
-   - Transcrição via Groq Whisper (`whisper-large-v3-turbo`)
-   - Análise do texto por um modelo de linguagem Groq (`llama-3.3-70b-versatile`)
-5. Veja o trecho sugerido (início, fim, duração, score e motivo).
-6. Ajuste os timestamps com sliders ou campos numéricos (máx. 50 s).
-7. Escolha o modo de corte:
-   - **Rápido** (`-c copy`) – padrão, quase instantâneo, alinhado a keyframes
-   - **Preciso** (re-encode) – frame-accurate, mais lento
-8. Clique em **“Gerar clipe”** e baixe o MP4.
-
----
-
-## Arquitetura
-
-```
-video-clipper/
-├── app.py                  # Interface Streamlit e orquestração
-├── requirements.txt
-├── .env.example
-├── .gitignore
-├── README.md
-├── src/
-│   ├── __init__.py
-│   ├── config.py           # Variáveis de ambiente, caminhos, modelos
-│   ├── transcription.py    # Extração de áudio + chamada Groq Whisper
-│   ├── clip_analyzer.py    # Prompt + análise LLM + validação JSON
-│   ├── video_processor.py  # Metadados (ffprobe) + corte FFmpeg
-│   └── utils.py            # Helpers (timestamps, JSON, arquivos temp)
-├── temp/                   # Arquivos temporários (áudio, uploads)
-├── output/                 # Clipes gerados
-└── tests/
-    ├── test_utils.py
-    ├── test_clip_analyzer.py
-    └── test_video_processor.py
-```
-
----
-
-## Detalhes técnicos importantes
-
-### Corte rápido vs preciso
-
-| Modo     | Comando principal                         | Velocidade | Precisão          |
-|----------|-------------------------------------------|------------|-------------------|
-| **fast** | `-ss START -i INPUT -t DUR -c copy`       | Instantâneo| Keyframe-aligned  |
-| **precise** | `-i INPUT -ss START -t DUR -c:v libx264` | Mais lento | Frame-accurate    |
-
-O modo **fast** é o padrão porque:
-
-- Não re-renderiza o vídeo
-- Consome quase zero CPU/GPU
-- É suficiente para a grande maioria dos casos de uso de clipes curtos
-
-A pequena imprecisão no início (geralmente < 1–2 s) é o preço do stream-copy. O modo preciso existe como opção avançada.
-
-### Modelos utilizados (2026)
-
-- Transcrição: `whisper-large-v3-turbo`
-- Análise: `llama-3.3-70b-versatile`
-
----
-
-## Testes
+### Testes
 
 ```bash
 pip install pytest
 pytest tests/ -v
 ```
 
-Os testes não fazem chamadas reais à API da Groq nem executam FFmpeg; eles validam parsing de JSON, construção de comandos e lógica de timestamps.
+### Gerar o instalador localmente (Windows)
 
----
+1. Instale [Inno Setup 6](https://jrsoftware.org/isinfo.php)
+2. Abra PowerShell na raiz do repositório:
+   ```powershell
+   .\scripts\prepare_portable.ps1
+   & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" installer\VideoClipper.iss
+   ```
+3. O instalador sairá em `dist\VideoClipperSetup.exe`
 
-## Solução de problemas
+### Publicar uma nova versão
 
-| Problema                         | Solução                                              |
-|----------------------------------|------------------------------------------------------|
-| `FFmpeg not found`               | Instale e adicione ao PATH ou use `FFMPEG_PATH`      |
-| `GROQ_API_KEY is not set`        | Crie `.env` ou exporte a variável                    |
-| Rate limit / 429                 | Aguarde alguns minutos (tier gratuito tem limites)   |
-| Áudio muito grande               | Use vídeos mais curtos ou comprima antes             |
-| Corte começa um pouco antes/depois | Use o modo **Preciso**                             |
-| Erro de JSON da IA               | Clique novamente em “Encontrar melhor clipe”         |
+```bash
+git tag v1.0.1
+git push origin v1.0.1
+```
 
----
+O workflow cria automaticamente um **GitHub Release** com o `VideoClipperSetup.exe`.
 
-## Limitações conhecidas
+### Modelo de corte
 
-- O modo `-c copy` não é frame-perfect (depende de keyframes).
-- Vídeos muito longos geram transcrições grandes; o texto é truncado se necessário.
-- A qualidade da seleção depende da qualidade da transcrição e do conteúdo falado.
+- **Padrão (rápido)**: `-c copy` (sem re-encode)
+- **Opcional (preciso)**: re-encode com libx264
+
+### Limitações
+
+- O modo `-c copy` alinha o início a keyframes (pode variar alguns frames).
+- A qualidade da seleção depende da transcrição e do conteúdo falado.
 - Rate limits da conta gratuita da Groq se aplicam.
 
 ---
 
 ## Licença
 
-Código liberado para uso pessoal e educacional. Use por sua conta e risco.
+Uso pessoal e educacional. Use por sua conta e risco.
