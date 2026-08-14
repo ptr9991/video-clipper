@@ -1,0 +1,41 @@
+# Environment
+.env
+.venv/
+venv/
+env/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Project runtime
+temp/*
+!temp/.gitkeep
+output/*
+!output/.gitkeep
+
+# Media (never commit videos)
+*.mp4
+*.mov
+*.mkv
+*.webm
+*.wav
+*.flac
+*.mp3
+
+# IDE / OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
