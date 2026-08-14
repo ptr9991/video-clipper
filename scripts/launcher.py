@@ -1,19 +1,21 @@
 """
 Video Clipper — Windows launcher
 
-- Shows a simple GUI to configure the Groq API Key (first run / when missing)
+- Shows a native Windows dialog to configure the Groq API Key (first run)
 - Locates bundled FFmpeg
 - Starts Streamlit headless
 - Opens the default browser when ready
-- No console window when launched via pythonw.exe
+- No dependency on tkinter (Python embeddable does not ship it)
 """
 
 from __future__ import annotations
 
+import json
 import os
 import socket
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import webbrowser
@@ -43,114 +45,159 @@ def _port_open(host: str = "127.0.0.1", port: int = 8501, timeout: float = 0.5) 
         return False
 
 
+def _powershell_input_dialog(existing: str = "") -> str | None:
+    """
+    Native Windows Forms dialog via PowerShell.
+    Returns the entered key, or None if cancelled / empty.
+    Works without tkinter (required for Python embeddable).
+    """
+    # Escape for embedding inside a single-quoted PowerShell string
+    safe_existing = (existing or "").replace("'", "''")
+
+    ps_script = f"""
+Add-Type -AssemblyName System.Windows.Forms
+Add-Type -AssemblyName System.Drawing
+
+$form = New-Object System.Windows.Forms.Form
+$form.Text = 'Video Clipper - Configuracao'
+$form.Size = New-Object System.Drawing.Size(480, 240)
+$form.StartPosition = 'CenterScreen'
+$form.FormBorderStyle = 'FixedDialog'
+$form.MaximizeBox = $false
+$form.MinimizeBox = $false
+$form.TopMost = $true
+
+$label = New-Object System.Windows.Forms.Label
+$label.Location = New-Object System.Drawing.Point(20, 20)
+$label.Size = New-Object System.Drawing.Size(420, 40)
+$label.Text = 'Informe sua chave da API Groq para continuar.`nA chave fica salva apenas neste computador.'
+$form.Controls.Add($label)
+
+$keyLabel = New-Object System.Windows.Forms.Label
+$keyLabel.Location = New-Object System.Drawing.Point(20, 70)
+$keyLabel.Size = New-Object System.Drawing.Size(100, 20)
+$keyLabel.Text = 'Groq API Key:'
+$form.Controls.Add($keyLabel)
+
+$textBox = New-Object System.Windows.Forms.TextBox
+$textBox.Location = New-Object System.Drawing.Point(20, 95)
+$textBox.Size = New-Object System.Drawing.Size(420, 25)
+$textBox.UseSystemPasswordChar = $true
+$textBox.Text = '{safe_existing}'
+$form.Controls.Add($textBox)
+
+$okButton = New-Object System.Windows.Forms.Button
+$okButton.Location = New-Object System.Drawing.Point(250, 140)
+$okButton.Size = New-Object System.Drawing.Size(90, 30)
+$okButton.Text = 'Continuar'
+$okButton.DialogResult = [System.Windows.Forms.DialogResult]::OK
+$form.AcceptButton = $okButton
+$form.Controls.Add($okButton)
+
+$cancelButton = New-Object System.Windows.Forms.Button
+$cancelButton.Location = New-Object System.Drawing.Point(350, 140)
+$cancelButton.Size = New-Object System.Drawing.Size(90, 30)
+$cancelButton.Text = 'Cancelar'
+$cancelButton.DialogResult = [System.Windows.Forms.DialogResult]::Cancel
+$form.CancelButton = $cancelButton
+$form.Controls.Add($cancelButton)
+
+$result = $form.ShowDialog()
+if ($result -eq [System.Windows.Forms.DialogResult]::OK) {{
+    Write-Output $textBox.Text
+}} else {{
+    Write-Output ''
+}}
+"""
+
+    # Write script to a temp file to avoid quoting hell on the command line
+    with tempfile.NamedTemporaryFile(
+        mode="w", suffix=".ps1", delete=False, encoding="utf-8-sig"
+    ) as f:
+        f.write(ps_script)
+        script_path = f.name
+
+    try:
+        creationflags = 0
+        if os.name == "nt":
+            creationflags = subprocess.CREATE_NO_WINDOW  # type: ignore[attr-defined]
+
+        proc = subprocess.run(
+            [
+                "powershell.exe",
+                "-NoProfile",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+                script_path,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=300,
+            creationflags=creationflags,
+        )
+        key = (proc.stdout or "").strip()
+        return key if key else None
+    except Exception:
+        return None
+    finally:
+        try:
+            os.unlink(script_path)
+        except OSError:
+            pass
+
+
+def _console_input_dialog(existing: str = "") -> str | None:
+    """Fallback when PowerShell dialog is unavailable."""
+    print()
+    print("=" * 50)
+    print("  Video Clipper — Configuração")
+    print("=" * 50)
+    print()
+    print("Informe sua chave da API Groq para continuar.")
+    print("A chave fica salva apenas neste computador.")
+    print()
+    if existing:
+        print(f"(Já existe uma chave salva. Pressione Enter para manter.)")
+    try:
+        key = input("Groq API Key: ").strip()
+    except (EOFError, KeyboardInterrupt):
+        return None
+    if not key and existing:
+        return existing
+    return key if key else None
+
+
 def show_api_key_dialog() -> bool:
     """
-    Tkinter dialog to enter / test the Groq API key.
+    Prompt for Groq API key using a native Windows dialog (or console fallback).
     Returns True if a key is now available, False if the user cancelled.
     """
-    import tkinter as tk
-    from tkinter import messagebox, ttk
-
     from src.config import get_api_key, set_api_key
 
     existing = get_api_key() or ""
 
-    root = tk.Tk()
-    root.title("Video Clipper — Configuração")
-    root.resizable(False, False)
-    root.attributes("-topmost", True)
+    key: str | None = None
+    if os.name == "nt":
+        key = _powershell_input_dialog(existing)
 
-    # Center window
-    w, h = 460, 260
-    sw = root.winfo_screenwidth()
-    sh = root.winfo_screenheight()
-    root.geometry(f"{w}x{h}+{(sw - w) // 2}+{(sh - h) // 2}")
+    if key is None and sys.stdin and sys.stdin.isatty():
+        key = _console_input_dialog(existing)
 
-    frame = ttk.Frame(root, padding=20)
-    frame.pack(fill=tk.BOTH, expand=True)
+    if not key:
+        return False
 
-    ttk.Label(
-        frame,
-        text="Video Clipper",
-        font=("Segoe UI", 16, "bold"),
-    ).pack(anchor=tk.W)
-
-    ttk.Label(
-        frame,
-        text="Informe sua chave da API Groq para continuar.\n"
-        "A chave fica salva apenas neste computador.",
-        justify=tk.LEFT,
-    ).pack(anchor=tk.W, pady=(8, 12))
-
-    ttk.Label(frame, text="Groq API Key:").pack(anchor=tk.W)
-
-    key_var = tk.StringVar(value=existing)
-    entry = ttk.Entry(frame, textvariable=key_var, width=52, show="•")
-    entry.pack(fill=tk.X, pady=(4, 8))
-    entry.focus()
-
-    status_var = tk.StringVar(value="")
-    status_lbl = ttk.Label(frame, textvariable=status_var, foreground="#555")
-    status_lbl.pack(anchor=tk.W, pady=(0, 8))
-
-    result = {"ok": False}
-
-    def test_connection() -> None:
-        key = key_var.get().strip()
-        if not key:
-            status_var.set("Digite a chave antes de testar.")
-            return
-        status_var.set("Testando conexão…")
-        root.update_idletasks()
-        try:
-            from groq import Groq
-
-            client = Groq(api_key=key)
-            # Lightweight call — list models
-            client.models.list()
-            status_var.set("✓ Conexão funcionando")
-            status_lbl.configure(foreground="#0a7")
-        except Exception as exc:
-            msg = str(exc)
-            if "401" in msg or "authentication" in msg.lower() or "invalid" in msg.lower():
-                status_var.set("Chave inválida. Verifique e tente novamente.")
-            else:
-                status_var.set(f"Erro: {msg[:80]}")
-            status_lbl.configure(foreground="#c00")
-
-    def on_continue() -> None:
-        key = key_var.get().strip()
-        if not key:
-            messagebox.showwarning("Chave obrigatória", "Informe a Groq API Key para continuar.")
-            return
-        set_api_key(key)
-        # Also set in current process so Streamlit child can inherit if needed
-        os.environ["GROQ_API_KEY"] = key
-        result["ok"] = True
-        root.destroy()
-
-    def on_cancel() -> None:
-        result["ok"] = False
-        root.destroy()
-
-    btn_row = ttk.Frame(frame)
-    btn_row.pack(fill=tk.X, pady=(8, 0))
-
-    ttk.Button(btn_row, text="Testar conexão", command=test_connection).pack(side=tk.LEFT)
-    ttk.Button(btn_row, text="Continuar", command=on_continue).pack(side=tk.RIGHT, padx=(8, 0))
-    ttk.Button(btn_row, text="Cancelar", command=on_cancel).pack(side=tk.RIGHT)
-
-    root.protocol("WM_DELETE_WINDOW", on_cancel)
-    root.mainloop()
-    return result["ok"]
+    set_api_key(key)
+    os.environ["GROQ_API_KEY"] = key
+    return True
 
 
 def ensure_api_key() -> bool:
     from src.config import get_api_key
 
-    if get_api_key():
-        # Still set env so child processes see it
-        os.environ["GROQ_API_KEY"] = get_api_key()
+    key = get_api_key()
+    if key:
+        os.environ["GROQ_API_KEY"] = key
         return True
     return show_api_key_dialog()
 
