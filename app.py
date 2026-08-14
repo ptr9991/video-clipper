@@ -90,41 +90,23 @@ with st.sidebar:
     st.header("⚙️ Status")
     ok_ffmpeg, ffmpeg_msg = check_ffmpeg()
     if ok_ffmpeg:
-        st.success(f"FFmpeg OK\n`{ffmpeg_msg}`")
+        st.success("FFmpeg OK")
+        st.caption(ffmpeg_msg)
     else:
         st.error("FFmpeg não encontrado")
         st.markdown(
-            """
-**Windows**
-1. Baixe em https://ffmpeg.org/download.html ou use `winget install ffmpeg`
-2. Adicione a pasta `bin` ao PATH
-3. Reinicie o terminal
-
-**macOS**
-```bash
-brew install ffmpeg
-```
-
-**Linux**
-```bash
-sudo apt install ffmpeg   # Debian/Ubuntu
-```
-"""
+            "Na versão instalada pelo **VideoClipperSetup.exe** o FFmpeg já vem embutido.\n\n"
+            "Se você está rodando pelo código-fonte, instale o FFmpeg ou defina FFMPEG_PATH."
         )
 
     try:
         require_api_key()
-        st.success("GROQ_API_KEY configurada")
+        st.success("API Key configurada")
     except RuntimeError:
-        st.warning("GROQ_API_KEY não definida")
+        st.warning("API Key não configurada")
         st.markdown(
-            """
-Crie um arquivo `.env` na raiz do projeto:
-```
-GROQ_API_KEY=sua_chave_aqui
-```
-ou exporte a variável de ambiente.
-"""
+            "Feche e abra o **Video Clipper** pelo atalho para informar a chave, "
+            "ou defina a variável de ambiente `GROQ_API_KEY`."
         )
 
     st.divider()
@@ -189,7 +171,7 @@ if uploaded is not None:
 
     # ---- Find best clip button ----
     if not ok_ffmpeg:
-        st.warning("Instale o FFmpeg antes de continuar.")
+        st.warning("FFmpeg não encontrado. Na versão instalada ele já vem embutido.")
         st.stop()
 
     try:
