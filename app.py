@@ -1,6 +1,7 @@
 """
 AI Video Clipper Local
-Groq (speech) + FFmpeg (cut) + optional local Qwen2.5-VL (visual review).
+Groq (speech) + FFmpeg (cut) + lightweight visual check (safe).
+Heavy VLM is opt-in only — can stress GPU drivers.
 """
 
 from __future__ import annotations
@@ -12,7 +13,6 @@ from typing import Optional
 import streamlit as st
 
 from src.config import (
-    DEBUG,
     MAX_CLIP_DURATION,
     OUTPUT_DIR,
     TEMP_DIR,
@@ -22,14 +22,6 @@ from src.config import (
 from src.clip_analyzer import ClipCandidate, analyze_best_clip
 from src.downloader import QUALITY_PRESETS, download_video
 from src.hardware import detect_hardware
-from src.ollama_manager import (
-    DEFAULT_VISION_MODEL,
-    download_ollama_installer,
-    get_status,
-    install_ollama_windows,
-    pull_model,
-    start_ollama,
-)
 from src.transcription import Segment, TranscriptionResult, transcribe_video
 from src.utils import (
     cleanup_file,
@@ -66,6 +58,7 @@ def init_state() -> None:
         "source_url": "",
         "visual_result": None,
         "enable_visual": True,
+        "use_heavy_vlm": False,  # OFF — caused system stress on some PCs
         "hw_info": None,
     }
     for k, v in defaults.items():
@@ -102,7 +95,7 @@ def reset_video_state() -> None:
 
 with st.sidebar:
     st.header("⚙️ Status")
-    ok_ffmpeg, ffmpeg_msg = check_ffmpeg()
+    ok_ffmpeg, _ = check_ffmpeg()
     if ok_ffmpeg:
         st.success("FFmpeg OK")
     else:
@@ -126,55 +119,21 @@ with st.sidebar:
         st.caption(f"GPU: **{hw.gpu_name}**")
         st.caption(f"VRAM: **{hw.vram_gb} GB**")
         st.caption(f"RAM: **{hw.ram_gb} GB**")
-        st.caption(f"CPU: {hw.cpu[:40]}")
 
     st.divider()
-    st.subheader("👁️ IA Visual Local")
-    st.caption("Análise **100% local** — o vídeo não sai do PC.")
-    ostatus = get_status(DEFAULT_VISION_MODEL)
-    st.caption(f"Modelo: `{DEFAULT_VISION_MODEL}`")
-    if ostatus.ready:
-        st.success("✓ Pronto")
-    else:
-        st.warning(ostatus.message or "Indisponível")
-
-    if not ostatus.installed:
-        if st.button("⬇️ Instalar Ollama (oficial)"):
-            with st.spinner("Baixando instalador oficial…"):
-                try:
-                    setup = TEMP_DIR / "OllamaSetup.exe"
-                    download_ollama_installer(setup)
-                    st.info("Abrindo instalador. Conclua a instalação e reinicie o app.")
-                    install_ollama_windows(setup)
-                except Exception as exc:
-                    show_error(str(exc))
-    elif not ostatus.running:
-        if st.button("▶️ Iniciar Ollama"):
-            if start_ollama():
-                st.success("Ollama iniciado")
-                st.rerun()
-            else:
-                st.error("Não foi possível iniciar. Abra o Ollama manualmente.")
-    elif not ostatus.model_installed:
-        if st.button("📦 Instalar IA Visual (baixar modelo)"):
-            prog = st.empty()
-
-            def _cb(msg: str) -> None:
-                prog.caption(msg)
-
-            try:
-                ok = pull_model(DEFAULT_VISION_MODEL, progress=_cb)
-                if ok:
-                    st.success("Modelo instalado!")
-                    st.rerun()
-                else:
-                    st.error("Falha no download do modelo.")
-            except Exception as exc:
-                show_error(str(exc))
-
+    st.subheader("👁️ Análise visual")
+    st.caption(
+        "**Modo leve (padrão):** só o clipe, 3 frames, sem rede neural. "
+        "Não carrega o Qwen na GPU."
+    )
     st.session_state.enable_visual = st.checkbox(
-        "Analisar clipe com IA local",
+        "Analisar clipe visualmente (leve)",
         value=st.session_state.enable_visual,
+    )
+    st.session_state.use_heavy_vlm = st.checkbox(
+        "⚠️ Usar Qwen na GPU (avançado — pode travar o PC)",
+        value=False,
+        help="Desligado por segurança. Só ative se o sistema estiver estável.",
     )
 
     st.divider()
@@ -188,7 +147,7 @@ with st.sidebar:
 
 st.title("🎬 AI Video Clipper Local")
 st.markdown(
-    "Upload ou link → **Groq** (fala) → **FFmpeg** (corte) → **Qwen local** (visão, opcional)."
+    "Upload ou link → **Groq** (fala) → **FFmpeg** (corte) → revisão visual **leve** (opcional)."
 )
 
 tab_upload, tab_url = st.tabs(["📁 Upload de arquivo", "🔗 Link (YouTube / URL)"])
@@ -363,23 +322,18 @@ if st.session_state.clip_path:
         st.download_button("⬇️ Baixar MP4", data, file_name=clip_p.name, mime="video/mp4", use_container_width=True)
 
         st.divider()
-        st.subheader("👁️ IA Visual Local (Qwen2.5-VL)")
-        st.caption("Frames analisados **no seu PC**. Nada de vídeo é enviado à nuvem nesta etapa.")
+        st.subheader("👁️ Revisão visual (leve)")
+        st.caption(
+            "Analisa **somente o clipe gerado** (não o vídeo inteiro), com 3 frames pequenos. "
+            "Sem carregar modelo de 6 GB na GPU."
+        )
 
-        ostatus = get_status(DEFAULT_VISION_MODEL)
         if not st.session_state.enable_visual:
-            st.info("Análise visual desativada na barra lateral.")
-        elif not ostatus.ready:
-            st.warning(
-                f"IA visual indisponível: {ostatus.message}. "
-                "Você pode continuar só com o clipe gerado."
-            )
+            st.info("Revisão visual desativada na barra lateral.")
         else:
-            if st.button("🔍 Analisar clipe com IA local", type="secondary", use_container_width=True):
-                with st.spinner("Extraindo frames e analisando (1–3 min na RTX 2070)…"):
+            if st.button("🔍 Revisar clipe (modo leve)", type="secondary", use_container_width=True):
+                with st.spinner("Analisando frames do clipe…"):
                     try:
-                        tr: Optional[TranscriptionResult] = st.session_state.transcription
-                        segs: list[Segment] = tr.segments if tr else []
                         speech = float(st.session_state.candidate.score) if st.session_state.candidate else 70.0
                         dur = float(st.session_state.manual_end - st.session_state.manual_start)
                         result = analyze_clip_visual(
@@ -387,9 +341,9 @@ if st.session_state.clip_path:
                             clip_duration=max(dur, 1.0),
                             clip_start_abs=float(st.session_state.manual_start),
                             clip_end_abs=float(st.session_state.manual_end),
-                            segments=segs,
+                            segments=[],
                             speech_score=speech,
-                            max_frames=4,
+                            use_vlm=bool(st.session_state.use_heavy_vlm),
                         )
                         st.session_state.visual_result = result
                     except Exception as exc:
@@ -397,50 +351,22 @@ if st.session_state.clip_path:
 
             vr: Optional[VisualAnalysis] = st.session_state.visual_result
             if vr is not None:
-                st.markdown(f"### Score final: **{vr.overall_score}/100** — `{vr.verdict}`")
+                st.markdown(f"### Score: **{vr.overall_score}/100** — `{vr.verdict}` ({vr.mode})")
                 m1, m2, m3, m4 = st.columns(4)
                 m1.metric("Hook visual", vr.visual_hook_score)
                 m2.metric("Retenção", vr.retention_score)
-                m3.metric("Composição", vr.composition_score)
-                m4.metric("Contexto", vr.context_match_score)
-                m5, m6, m7, m8 = st.columns(4)
-                m5.metric("Emoção", vr.emotion_score)
-                m6.metric("Qualidade", vr.visual_quality_score)
-                m7.metric("Short-form", vr.short_form_score)
-                m8.metric("Confiança", f"{vr.confidence:.0%}")
+                m3.metric("Qualidade", vr.visual_quality_score)
+                m4.metric("Short-form", vr.short_form_score)
                 if vr.strengths:
                     st.markdown("**Pontos fortes:** " + "; ".join(vr.strengths))
                 if vr.problems:
                     st.markdown("**Problemas:** " + "; ".join(vr.problems))
                 if vr.suggestions:
                     st.markdown("**Sugestões:** " + "; ".join(vr.suggestions))
-                st.caption(f"Frames: {vr.frames_used} · Inferência: {vr.inference_ms} ms")
-
-                if vr.suggested_start is not None or vr.suggested_end is not None:
-                    abs_start = float(st.session_state.manual_start) + float(vr.suggested_start or 0)
-                    abs_end = float(st.session_state.manual_start) + float(
-                        vr.suggested_end
-                        if vr.suggested_end is not None
-                        else (st.session_state.manual_end - st.session_state.manual_start)
-                    )
-                    st.info(f"Sugestão de recorte: {abs_start:.1f}s → {abs_end:.1f}s")
-                    colx, coly = st.columns(2)
-                    with colx:
-                        if st.button("✅ Aplicar sugestão"):
-                            st.session_state.manual_start = abs_start
-                            st.session_state.manual_end = abs_end
-                            st.session_state.clip_path = None
-                            st.session_state.visual_result = None
-                            st.success("Sugestão aplicada. Gere o clipe novamente.")
-                            st.rerun()
-                    with coly:
-                        if st.button("↩️ Manter clipe"):
-                            st.info("Mantido o clipe atual.")
+                st.caption(f"Frames: {vr.frames_used} · {vr.inference_ms} ms · modo {vr.mode}")
     else:
         st.warning("Arquivo do clipe não encontrado.")
         st.session_state.clip_path = None
 
 st.divider()
-st.caption(
-    "Groq = fala/transcrição · FFmpeg = corte local · Qwen2.5-VL via Ollama = visão local (RTX 2070 8GB)."
-)
+st.caption("Groq = fala · FFmpeg = corte local · Revisão visual leve por padrão (sem VLM na GPU).")
