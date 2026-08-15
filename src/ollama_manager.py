@@ -7,6 +7,7 @@ import os
 import platform
 import shutil
 import subprocess
+import tempfile
 import time
 import urllib.request
 from dataclasses import dataclass
@@ -15,11 +16,20 @@ from typing import Callable, Optional
 
 log = logging.getLogger("video_clipper.ollama")
 
-# Official model tag (verified on ollama.com/library/qwen2.5vl)
-DEFAULT_VISION_MODEL = "qwen2.5vl:7b"
+# Base model from ollama.com/library/qwen2.5vl
+BASE_VISION_MODEL = "qwen2.5vl:7b"
+# Derived model tuned for 8 GB VRAM (RTX 2070): small context = small KV cache
+DEFAULT_VISION_MODEL = "qwen2.5vl-2070"
 OLLAMA_API = "http://127.0.0.1:11434"
-# Official Windows installer (ollama.com/download)
 OLLAMA_WINDOWS_URL = "https://ollama.com/download/OllamaSetup.exe"
+
+# Modelfile baked for 8 GB cards — prevents 128k default context allocation
+OPTIMIZED_MODELFILE = """FROM qwen2.5vl:7b
+PARAMETER num_ctx 4096
+PARAMETER temperature 0.1
+PARAMETER num_predict 400
+PARAMETER num_batch 256
+"""
 
 
 @dataclass
@@ -59,8 +69,6 @@ def find_ollama_binary() -> Optional[str]:
 
 def is_ollama_running(timeout: float = 2.0) -> bool:
     try:
-        import urllib.request
-
         req = urllib.request.Request(f"{OLLAMA_API}/api/tags", method="GET")
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             return resp.status == 200
@@ -71,7 +79,6 @@ def is_ollama_running(timeout: float = 2.0) -> bool:
 def list_models() -> list[str]:
     try:
         import json
-        import urllib.request
 
         with urllib.request.urlopen(f"{OLLAMA_API}/api/tags", timeout=5) as resp:
             data = json.loads(resp.read().decode())
@@ -81,25 +88,23 @@ def list_models() -> list[str]:
         return []
 
 
-def model_is_installed(model: str = DEFAULT_VISION_MODEL) -> bool:
+def model_is_installed(model: str) -> bool:
     names = list_models()
-    # Match exact or prefix (qwen2.5vl:7b vs qwen2.5vl:7b-...)
-    base = model.split(":")[0]
     for n in names:
-        if n == model or n.startswith(model) or n.startswith(base + ":"):
-            if model in n or n.startswith(model):
+        if n == model or n.startswith(model + ":") or n.split(":")[0] == model.split(":")[0] and model in n:
+            if n == model or n.startswith(model):
                 return True
-            # also accept bare tag family with :7b
-            if ":7b" in model and ":7b" in n and base in n:
-                return True
-    return model in names
+    return model in names or any(n.split(":")[0] == model for n in names)
 
 
 def get_status(model: str = DEFAULT_VISION_MODEL) -> OllamaStatus:
     binary = find_ollama_binary()
     installed = binary is not None
     running = is_ollama_running() if installed else False
-    has_model = model_is_installed(model) if running else False
+    # Ready if optimized model OR base model is present
+    has_model = False
+    if running:
+        has_model = model_is_installed(model) or model_is_installed(BASE_VISION_MODEL)
     version = ""
     if binary:
         try:
@@ -119,7 +124,7 @@ def get_status(model: str = DEFAULT_VISION_MODEL) -> OllamaStatus:
     elif not running:
         msg = "Ollama instalado, mas não está em execução"
     elif not has_model:
-        msg = f"Modelo {model} não baixado"
+        msg = f"Modelo {BASE_VISION_MODEL} não baixado"
     return OllamaStatus(
         installed=installed,
         running=running,
@@ -131,14 +136,12 @@ def get_status(model: str = DEFAULT_VISION_MODEL) -> OllamaStatus:
 
 
 def start_ollama() -> bool:
-    """Try to start Ollama service (Windows app / ollama serve)."""
     if is_ollama_running():
         return True
     binary = find_ollama_binary()
     if not binary:
         return False
     try:
-        # On Windows, launching ollama app usually starts the tray service
         if platform.system() == "Windows":
             app = Path(binary).with_name("ollama app.exe")
             target = str(app) if app.is_file() else binary
@@ -164,21 +167,17 @@ def start_ollama() -> bool:
 
 
 def download_ollama_installer(dest: Path, progress: Optional[Callable[[float], None]] = None) -> Path:
-    """Download official Windows OllamaSetup.exe."""
     dest.parent.mkdir(parents=True, exist_ok=True)
-    url = OLLAMA_WINDOWS_URL
-    log.info("Downloading Ollama from %s", url)
 
     def _report(block_num: int, block_size: int, total: int) -> None:
         if progress and total > 0:
             progress(min(1.0, (block_num * block_size) / total))
 
-    urllib.request.urlretrieve(url, str(dest), reporthook=_report)
+    urllib.request.urlretrieve(OLLAMA_WINDOWS_URL, str(dest), reporthook=_report)
     return dest
 
 
 def install_ollama_windows(installer_path: Path) -> bool:
-    """Run OllamaSetup.exe silently if possible."""
     try:
         subprocess.run(
             [str(installer_path), "/SILENT"],
@@ -189,7 +188,6 @@ def install_ollama_windows(installer_path: Path) -> bool:
         return find_ollama_binary() is not None
     except Exception as exc:
         log.error("Ollama install failed: %s", exc)
-        # Fallback: open installer for user
         try:
             os.startfile(str(installer_path))  # type: ignore[attr-defined]
         except Exception:
@@ -198,10 +196,9 @@ def install_ollama_windows(installer_path: Path) -> bool:
 
 
 def pull_model(
-    model: str = DEFAULT_VISION_MODEL,
+    model: str = BASE_VISION_MODEL,
     progress: Optional[Callable[[str], None]] = None,
 ) -> bool:
-    """Pull vision model via `ollama pull`."""
     binary = find_ollama_binary()
     if not binary:
         raise RuntimeError("Ollama não encontrado.")
@@ -210,7 +207,7 @@ def pull_model(
             raise RuntimeError("Não foi possível iniciar o Ollama.")
 
     if progress:
-        progress(f"Baixando {model}… (pode levar vários minutos)")
+        progress(f"Baixando {model}…")
 
     proc = subprocess.Popen(
         [binary, "pull", model],
@@ -224,9 +221,70 @@ def pull_model(
         line = line.strip()
         if line and progress:
             progress(line[:120])
-        log.debug("pull: %s", line)
     code = proc.wait(timeout=3600)
     ok = code == 0 and model_is_installed(model)
     if progress:
-        progress("Modelo pronto." if ok else "Falha ao baixar o modelo.")
+        progress("Base OK." if ok else "Falha no download.")
+    if ok:
+        # Create optimized variant for 8GB
+        ensure_optimized_model(progress=progress)
     return ok
+
+
+def ensure_optimized_model(
+    progress: Optional[Callable[[str], None]] = None,
+) -> str:
+    """
+    Create derived model with num_ctx=4096 so KV cache fits in 8 GB VRAM.
+    Returns the model name to use for inference.
+    """
+    binary = find_ollama_binary()
+    if not binary:
+        raise RuntimeError("Ollama não encontrado.")
+    if not is_ollama_running():
+        if not start_ollama():
+            raise RuntimeError("Ollama não está em execução.")
+
+    if model_is_installed(DEFAULT_VISION_MODEL):
+        if progress:
+            progress(f"Modelo otimizado já existe: {DEFAULT_VISION_MODEL}")
+        return DEFAULT_VISION_MODEL
+
+    if not model_is_installed(BASE_VISION_MODEL):
+        if progress:
+            progress(f"Baixando base {BASE_VISION_MODEL}…")
+        if not pull_model(BASE_VISION_MODEL, progress=progress):
+            raise RuntimeError(f"Não foi possível baixar {BASE_VISION_MODEL}")
+
+    if progress:
+        progress("Criando variante otimizada para RTX 2070 (num_ctx 4096)…")
+
+    with tempfile.NamedTemporaryFile(
+        mode="w", suffix=".Modelfile", delete=False, encoding="utf-8"
+    ) as f:
+        f.write(OPTIMIZED_MODELFILE)
+        mf_path = f.name
+
+    try:
+        r = subprocess.run(
+            [binary, "create", DEFAULT_VISION_MODEL, "-f", mf_path],
+            capture_output=True,
+            text=True,
+            timeout=300,
+            creationflags=_no_window_flags(),
+        )
+        if r.returncode != 0:
+            log.error("create failed: %s %s", r.stdout, r.stderr)
+            # Fallback to base model
+            if progress:
+                progress("Fallback para modelo base.")
+            return BASE_VISION_MODEL
+    finally:
+        try:
+            os.unlink(mf_path)
+        except OSError:
+            pass
+
+    if progress:
+        progress(f"Pronto: {DEFAULT_VISION_MODEL}")
+    return DEFAULT_VISION_MODEL if model_is_installed(DEFAULT_VISION_MODEL) else BASE_VISION_MODEL

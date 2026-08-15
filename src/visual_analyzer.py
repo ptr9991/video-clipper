@@ -1,4 +1,4 @@
-"""Local visual analysis of clips via Ollama Qwen2.5-VL."""
+"""Local visual analysis of clips via Ollama Qwen2.5-VL (RTX 2070 tuned)."""
 
 from __future__ import annotations
 
@@ -9,22 +9,30 @@ from pathlib import Path
 from typing import Any, Optional
 
 from src.frame_extractor import cleanup_frames, extract_frames
-from src.ollama_manager import DEFAULT_VISION_MODEL, is_ollama_running
+from src.ollama_manager import (
+    DEFAULT_VISION_MODEL,
+    ensure_optimized_model,
+    is_ollama_running,
+)
 from src.scoring import FinalScore, combine_scores
 from src.transcription import Segment
 from src.utils import extract_json_from_text
 
 log = logging.getLogger("video_clipper.visual")
 
-# Keep low for 8 GB VRAM + default 4k context; images are expensive in tokens
-DEFAULT_MAX_FRAMES = 4
-DEFAULT_FRAME_WIDTH = 384
+# RTX 2070 8GB: few small frames keep vision tokens under num_ctx 4096
+DEFAULT_MAX_FRAMES = 3
+DEFAULT_FRAME_WIDTH = 320
 
-SYSTEM_PROMPT = """Você analisa clipes curtos para TikTok/Reels/Shorts.
-Dado frames em ordem temporal + transcrição, responda SÓ JSON:
-{"overall_score":80,"visual_hook_score":80,"retention_score":80,"composition_score":80,"emotion_score":80,"visual_quality_score":80,"context_match_score":80,"short_form_score":80,"verdict":"APPROVE","confidence":0.8,"problems":[],"strengths":[],"suggestions":[],"suggested_start":null,"suggested_end":null}
-verdict: APPROVE|REVIEW|REJECT. suggested_* em segundos relativos ao clipe ou null.
-"""
+SYSTEM_PROMPT = (
+    "Editor de shorts. Com frames em ordem + fala, responda SÓ JSON:\n"
+    '{"overall_score":80,"visual_hook_score":80,"retention_score":80,'
+    '"composition_score":80,"emotion_score":80,"visual_quality_score":80,'
+    '"context_match_score":80,"short_form_score":80,"verdict":"APPROVE",'
+    '"confidence":0.8,"problems":[],"strengths":[],"suggestions":[],'
+    '"suggested_start":null,"suggested_end":null}\n'
+    "verdict: APPROVE|REVIEW|REJECT. suggested_* segundos relativos ou null."
+)
 
 
 @dataclass
@@ -54,7 +62,7 @@ def _segments_for_clip(
     segments: list[Segment],
     clip_start: float,
     clip_end: float,
-    max_chars: int = 1200,
+    max_chars: int = 600,
 ) -> str:
     lines = []
     for seg in segments:
@@ -62,8 +70,8 @@ def _segments_for_clip(
             continue
         rel_s = max(0.0, seg.start - clip_start)
         rel_e = max(0.0, seg.end - clip_start)
-        lines.append(f"[{rel_s:.1f}-{rel_e:.1f}s] {seg.text}")
-    text = "\n".join(lines) if lines else "(sem transcrição)"
+        lines.append(f"[{rel_s:.0f}-{rel_e:.0f}s] {seg.text}")
+    text = " | ".join(lines) if lines else "(sem fala)"
     return text[:max_chars]
 
 
@@ -123,9 +131,9 @@ def _to_analysis(data: dict[str, Any], raw: str, frames: int, ms: int) -> Visual
         short_form_score=gi("short_form_score"),
         verdict=verdict,
         confidence=max(0.0, min(1.0, gf("confidence", 0.7))),
-        problems=[str(p) for p in problems][:6],
-        strengths=[str(s) for s in strengths][:6],
-        suggestions=[str(s) for s in suggestions][:6],
+        problems=[str(p) for p in problems][:5],
+        strengths=[str(s) for s in strengths][:5],
+        suggestions=[str(s) for s in suggestions][:5],
         suggested_start=ss_f,
         suggested_end=se_f,
         raw=raw,
@@ -141,15 +149,19 @@ def analyze_clip_visual(
     clip_end_abs: float,
     segments: list[Segment],
     speech_score: float = 70.0,
-    model: str = DEFAULT_VISION_MODEL,
+    model: Optional[str] = None,
     max_frames: int = DEFAULT_MAX_FRAMES,
 ) -> VisualAnalysis:
     """
-    Extract a few frames + call local Ollama vision model.
-    Tuned for RTX 2070 8GB (few frames, smaller resolution, higher num_ctx).
+    Visual analysis tuned for RTX 2070 8 GB:
+    - derived model with num_ctx 4096 (avoids 128k KV allocation)
+    - 3 frames @ 320px
+    - short transcript + JSON-only prompt
     """
     if not is_ollama_running():
         raise RuntimeError("Ollama não está em execução.")
+
+    model_name = model or ensure_optimized_model()
 
     frames = extract_frames(
         clip_path,
@@ -162,9 +174,8 @@ def analyze_clip_visual(
 
     transcript_block = _segments_for_clip(segments, clip_start_abs, clip_end_abs)
     user_text = (
-        f"Clipe {clip_duration:.0f}s. {len(frames)} frames em ordem.\n"
-        f"Fala:\n{transcript_block}\n"
-        "Avalie e responda só JSON."
+        f"{clip_duration:.0f}s, {len(frames)} frames.\n"
+        f"Fala: {transcript_block}\nJSON only."
     )
 
     t0 = time.time()
@@ -172,22 +183,21 @@ def analyze_clip_visual(
     try:
         import ollama
 
-        image_paths = [str(p) for p in frames]
         response = ollama.chat(
-            model=model,
+            model=model_name,
             messages=[
                 {"role": "system", "content": SYSTEM_PROMPT},
                 {
                     "role": "user",
                     "content": user_text,
-                    "images": image_paths,
+                    "images": [str(p) for p in frames],
                 },
             ],
             options={
                 "temperature": 0.1,
-                "num_predict": 500,
-                # Raise context so a few vision tokens fit (8GB card)
-                "num_ctx": 8192,
+                "num_predict": 400,
+                "num_ctx": 4096,
+                "num_batch": 256,
             },
             format="json",
         )
@@ -211,10 +221,11 @@ def analyze_clip_visual(
         cleanup_frames(frames)
 
     log.info(
-        "Visual analysis: score=%d verdict=%s frames=%d ms=%d",
+        "Visual analysis: score=%d verdict=%s frames=%d ms=%d model=%s",
         analysis.overall_score,
         analysis.verdict,
         analysis.frames_used,
         analysis.inference_ms,
+        model_name,
     )
     return analysis
