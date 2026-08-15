@@ -6,18 +6,12 @@ import uuid
 
 from src.campaigns.models import CampaignProfile
 from src.editor.models import AspectRatio, ProjectState, TextOverlay
-from src.preset import get_default_shorts if False else None  # type: ignore
 
 
 def apply_campaign_to_project(state: ProjectState, campaign: CampaignProfile) -> ProjectState:
-    """
-    Clone project, force 9:16, ensure Twitch CTA text overlay for full duration.
-    Does not invent @handle. Does not burn hashtag into video frames.
-    """
+    """Force 9:16 + Twitch CTA text overlay for full duration."""
     s = state.clone()
     s.aspect = AspectRatio.VERTICAL_9_16
-
-    # Remove previous campaign CTA markers
     s.texts = [t for t in s.texts if not (t.id or "").startswith("cta_campaign_")]
 
     cta = campaign.cta
@@ -41,7 +35,8 @@ def apply_campaign_to_project(state: ProjectState, campaign: CampaignProfile) ->
 def project_has_twitch_cta(state: ProjectState, campaign: CampaignProfile) -> bool:
     needle = (campaign.cta.text or "twitch").lower()
     for t in state.texts:
-        if needle in (t.text or "").lower() or "twitch" in (t.text or "").lower():
-            if t.end > t.start and (t.end - t.start) >= min(1.0, state.timeline_duration * 0.5):
+        low = (t.text or "").lower()
+        if needle in low or "twitch" in low:
+            if t.end > t.start and (t.end - t.start) >= min(1.0, max(0.5, state.timeline_duration * 0.5)):
                 return True
     return False

@@ -1,4 +1,4 @@
-"""Video Clipper — simple flow: analyze → pick → 9:16 editor → export."""
+"""Video Clipper — analyze → pick → 9:16 editor → optional DONA 30K campaign export."""
 
 from __future__ import annotations
 
@@ -10,18 +10,15 @@ from typing import Any, Optional
 import streamlit as st
 
 from src.cache import file_sha256, load_json, save_json
+from src.campaigns.apply import apply_campaign_to_project
+from src.campaigns.copygen import build_platform_copy
+from src.campaigns.loader import load_campaign
+from src.campaigns.validator import validate_campaign_export
 from src.captions import WordStamp
 from src.clip_analyzer import ClipCandidate, analyze_best_clips
 from src.config import OUTPUT_DIR, TEMP_DIR, check_ffmpeg, require_api_key
 from src.downloader import QUALITY_PRESETS, download_video
-from src.editor import (
-    AspectRatio,
-    HistoryStack,
-    apply_trim,
-    new_project_from_clip,
-    render_timeline_html,
-    run_export,
-)
+from src.editor import AspectRatio, HistoryStack, apply_trim, new_project_from_clip, render_timeline_html, run_export
 from src.preset import CANVAS_H, CANVAS_W, DEFAULT
 from src.thumbnails import extract_thumbnail
 from src.transcription import Segment, TranscriptionResult, transcribe_video
@@ -60,6 +57,9 @@ def init_state() -> None:
         "prefer_local": False, "top_n": 5,
         "editor_open": False, "editor_history": None,
         "export_path": None, "perf_log": [],
+        "campaign_mode": False,
+        "campaign_handle": "",
+        "platform_copies": None,
     }
     for k, v in d.items():
         if k not in st.session_state:
@@ -87,11 +87,14 @@ def save_upload(uploaded) -> Path:
 
 
 def reset_analysis() -> None:
-    for k in ("transcription", "candidates", "clip_path", "export_path"):
-        st.session_state[k] = None if k != "candidates" else []
+    st.session_state.transcription = None
+    st.session_state.candidates = []
+    st.session_state.clip_path = None
+    st.session_state.export_path = None
     st.session_state.editor_open = False
     st.session_state.editor_history = None
     st.session_state.perf_log = []
+    st.session_state.platform_copies = None
 
 
 def transcription_from_cache(data: dict) -> TranscriptionResult:
@@ -115,7 +118,7 @@ def transcription_to_cache(tr: TranscriptionResult) -> dict:
 def open_editor(cand: ClipCandidate, idx: int) -> None:
     OUTPUT_DIR.mkdir(exist_ok=True)
     out = OUTPUT_DIR / generate_output_filename(prefix=f"clip{idx+1}")
-    with st.spinner("Preparando 9:16 + legendas padrao…"):
+    with st.spinner("Preparando 9:16 + legendas…"):
         cut_video(Path(st.session_state.video_path), cand.start, cand.end, out, mode="fast")
     st.session_state.clip_path = str(out)
     meta = get_video_info(out)
@@ -129,20 +132,76 @@ def open_editor(cand: ClipCandidate, idx: int) -> None:
         clip_start_abs=cand.start,
         transcription=tr,
     )
-    # lock standard
     proj.aspect = AspectRatio.VERTICAL_9_16
+
+    if st.session_state.campaign_mode:
+        try:
+            camp = load_campaign("dona30k")
+            if st.session_state.campaign_handle:
+                camp.with_handle(st.session_state.campaign_handle)
+            proj = apply_campaign_to_project(proj, camp)
+        except Exception as e:
+            logger.warning("campaign apply: %s", e)
+
     st.session_state.editor_history = HistoryStack(proj)
     st.session_state.editor_open = True
     st.session_state.export_path = None
+    st.session_state.platform_copies = None
 
 
 st.markdown(
     '<div class="vc-header"><div class="vc-logo">VIDEO <span>CLIPPER</span></div>'
-    f'<div class="vc-muted">Default · {CANVAS_W}x{CANVAS_H} · font {DEFAULT.font_size}</div></div>',
+    f'<div class="vc-muted">{CANVAS_W}x{CANVAS_H} · font {DEFAULT.font_size}</div></div>',
     unsafe_allow_html=True,
 )
 
 ok_ffmpeg, _ = check_ffmpeg()
+
+# ── Campaign toggle ──────────────────────────────────────
+st.markdown('<div class="vc-section">Campanha</div>', unsafe_allow_html=True)
+st.session_state.campaign_mode = st.toggle(
+    "MODO DONA 30K",
+    value=st.session_state.campaign_mode,
+    help="Aplica CTA Twitch.tv/dona, hashtag #dona30K e validacao antes do export",
+)
+
+if st.session_state.campaign_mode:
+    try:
+        camp_preview = load_campaign("dona30k")
+    except Exception as e:
+        err(f"Perfil campanha: {e}")
+        camp_preview = None
+
+    if camp_preview:
+        st.markdown(
+            f'<div class="vc-card"><b>{camp_preview.name}</b><br>'
+            f'<span class="vc-muted">{camp_preview.start_date[:10]} → {camp_preview.end_date[:10]}</span><br>'
+            f'Hashtag: <code>{camp_preview.hashtag}</code> · Twitch: <code>{camp_preview.twitch_display}</code></div>',
+            unsafe_allow_html=True,
+        )
+        handle = st.text_input(
+            "@ oficial do Dona (obrigatorio — nao inventamos)",
+            value=st.session_state.campaign_handle,
+            placeholder="@perfil_oficial",
+        )
+        st.session_state.campaign_handle = handle.strip()
+        if not st.session_state.campaign_handle:
+            st.warning("Configure o @ oficial antes de exportar para o campeonato.")
+
+        with st.expander("Regras da campanha"):
+            st.markdown("**Obrigatorio**")
+            for r in camp_preview.rules_required:
+                st.write(f"• {r}")
+            st.markdown("**Proibido**")
+            for r in camp_preview.rules_forbidden:
+                st.write(f"• {r}")
+            st.info(
+                "O regulamento proibe cortes feitos exclusivamente com plataformas de IA "
+                "(ex.: Opus Clip). O VideoClipper e editor/assistente — voce continua "
+                "responsavel pela edicao e publicacao."
+            )
+            st.caption("Participacao no WhatsApp oficial: verifique manualmente.")
+
 st.session_state.prefer_local = st.checkbox("IA local (CPU)", value=False)
 st.session_state.top_n = st.select_slider("Cortes", options=[5, 10, 15], value=5)
 
@@ -208,7 +267,6 @@ if vpath:
                 st.session_state.video_hash = file_sha256(vpath)
                 perf("Hash", time.time() - t0)
             vhash = st.session_state.video_hash
-
             cached = load_json(vhash, "transcription")
             if cached and not cached.get("words"):
                 cached = None
@@ -216,7 +274,7 @@ if vpath:
                 status.write("Transcricao (cache)")
                 tr = transcription_from_cache(cached)
             else:
-                status.write("Transcrevendo (1x)…")
+                status.write("Transcrevendo…")
                 t0 = time.time()
                 tr, audio = transcribe_video(vpath, prefer_local=prefer)
                 cleanup_file(audio)
@@ -255,20 +313,20 @@ if st.session_state.candidates:
             th = extract_thumbnail(Path(st.session_state.video_path), cand.start + 1.0, vhash)
             if th.exists() and th.stat().st_size > 100:
                 st.image(str(th), use_container_width=True)
-            st.markdown(f"**#{i+1}** `{format_timestamp(cand.start)}` · score {cand.score}")
+            st.markdown(f"**#{i+1}** `{format_timestamp(cand.start)}` · {cand.score}")
             if st.button("Editar", key=f"e{i}", type="primary", use_container_width=True):
                 open_editor(cand, i)
                 st.rerun()
 
-# ── Editor (minimal) ─────────────────────────────────────
 if st.session_state.editor_open and st.session_state.editor_history and st.session_state.clip_path:
     hist: HistoryStack = st.session_state.editor_history
     state = hist.current
     clip_p = Path(st.session_state.clip_path)
 
+    mode_label = "DONA 30K" if st.session_state.campaign_mode else "padrao"
     st.markdown(
-        f'<div class="vc-section">3 · Editor · 9:16 · {len(state.captions)} legendas · '
-        f'padrao font={DEFAULT.font_size}</div>',
+        f'<div class="vc-section">3 · Editor · {mode_label} · {len(state.captions)} legendas · '
+        f'{len(state.texts)} textos/CTA</div>',
         unsafe_allow_html=True,
     )
     st.markdown(render_timeline_html(state), unsafe_allow_html=True)
@@ -276,40 +334,82 @@ if st.session_state.editor_open and st.session_state.editor_history and st.sessi
     left, right = st.columns([1.3, 1])
     with left:
         st.video(str(clip_p))
+        if st.session_state.campaign_mode:
+            st.caption("CTA Twitch sera queimado no export (canto superior). Preview HTML nao mostra overlay.")
     with right:
-        st.caption("Padrao VideoClipper — sem seletor de estilo.")
-        st.write(f"Formato: **{CANVAS_W}×{CANVAS_H}** · Legendas: **ON**")
-        # optional fine trim only
-        with st.expander("Ajuste fino (opcional)"):
-            a = st.number_input("Início", 0.0, state.source_duration, float(state.playable_range.start), 0.05)
+        with st.expander("Ajuste fino"):
+            a = st.number_input("Inicio", 0.0, state.source_duration, float(state.playable_range.start), 0.05)
             b = st.number_input("Fim", 0.0, state.source_duration, float(state.playable_range.end), 0.05)
             if st.button("Aplicar trim") and b > a:
                 hist.push(apply_trim(state, a, b))
                 st.rerun()
-            for i, cap in enumerate(state.captions[:15]):
-                nt = st.text_input(f"{cap.start:.1f}s", cap.text.replace("\\N", " / "), key=f"c{cap.id}")
-                # store without breaking ASS newline marker if user edits simply
-                cleaned = nt.replace(" / ", "\\N")
-                if cleaned != cap.text:
-                    s = state.clone()
-                    s.captions[i].text = cleaned
-                    hist.push(s)
-                    st.rerun()
 
-        if st.button("EXPORTAR 1080×1920", type="primary", use_container_width=True):
-            OUTPUT_DIR.mkdir(exist_ok=True)
-            out = OUTPUT_DIR / generate_output_filename(prefix="final")
-            bar = st.progress(0.0)
+        # Re-apply campaign CTA if mode on
+        if st.session_state.campaign_mode and st.button("Reaplicar CTA Twitch"):
+            camp = load_campaign("dona30k")
+            camp.with_handle(st.session_state.campaign_handle)
+            hist.push(apply_campaign_to_project(hist.current, camp))
+            st.rerun()
 
-            def cb(p, msg):
-                bar.progress(min(1.0, p), text=msg)
+        st.markdown("---")
+        if st.session_state.campaign_mode:
+            camp = load_campaign("dona30k")
+            camp.with_handle(st.session_state.campaign_handle)
+            # ensure CTA present before validate
+            if not any("twitch" in (t.text or "").lower() for t in hist.current.texts):
+                hist.push(apply_campaign_to_project(hist.current, camp))
+                st.rerun()
 
-            try:
-                run_export(hist.current, out, burn_captions=True, progress=cb)
-                st.session_state.export_path = str(out)
-                st.success("Export OK")
-            except Exception as e:
-                err(str(e))
+            result = validate_campaign_export(hist.current, camp)
+            st.markdown("**Checklist campeonato**")
+            for name, passed, msg in result.checks:
+                st.write(("✓ " if passed else "✗ ") + msg)
+
+            if not result.ok:
+                st.error("CORTE NAO ESTA PRONTO PARA O CAMPEONATO")
+            else:
+                st.success("Requisitos OK")
+
+            if st.button(
+                "EXPORTAR PARA CAMPEONATO",
+                type="primary",
+                use_container_width=True,
+                disabled=not result.ok,
+            ):
+                OUTPUT_DIR.mkdir(exist_ok=True)
+                out = OUTPUT_DIR / generate_output_filename(prefix="dona30k")
+                bar = st.progress(0.0)
+
+                def cb(p, msg):
+                    bar.progress(min(1.0, p), text=msg)
+
+                try:
+                    # ensure campaign applied
+                    final_state = apply_campaign_to_project(hist.current, camp)
+                    run_export(final_state, out, burn_captions=True, progress=cb)
+                    st.session_state.export_path = str(out)
+                    hook = ""
+                    if st.session_state.candidates:
+                        hook = (st.session_state.candidates[0].hook or "")[:100]
+                    st.session_state.platform_copies = build_platform_copy(camp, clip_hook=hook)
+                    st.success("Export campeonato OK — confira o MP4 (CTA no canto)")
+                except Exception as e:
+                    err(str(e))
+        else:
+            if st.button("EXPORTAR 1080×1920", type="primary", use_container_width=True):
+                OUTPUT_DIR.mkdir(exist_ok=True)
+                out = OUTPUT_DIR / generate_output_filename(prefix="final")
+                bar = st.progress(0.0)
+
+                def cb2(p, msg):
+                    bar.progress(min(1.0, p), text=msg)
+
+                try:
+                    run_export(hist.current, out, burn_captions=True, progress=cb2)
+                    st.session_state.export_path = str(out)
+                    st.success("Export OK")
+                except Exception as e:
+                    err(str(e))
 
     if st.session_state.export_path and Path(st.session_state.export_path).exists():
         ep = Path(st.session_state.export_path)
@@ -317,4 +417,12 @@ if st.session_state.editor_open and st.session_state.editor_history and st.sessi
         with ep.open("rb") as f:
             st.download_button("Baixar MP4", f.read(), file_name=ep.name, mime="video/mp4", use_container_width=True)
 
-st.caption("Um padrao · 9:16 · legendas consistentes · sem estilos extras")
+        if st.session_state.platform_copies:
+            st.markdown('<div class="vc-section">Publicacao (copie e cole)</div>', unsafe_allow_html=True)
+            for pc in st.session_state.platform_copies:
+                with st.expander(pc.platform):
+                    if pc.title:
+                        st.text_area("Titulo", pc.title, key=f"t_{pc.platform}")
+                    st.text_area("Descricao", pc.description, key=f"d_{pc.platform}")
+
+st.caption("MODO DONA 30K · CTA no video · #dona30K na copy · @ configuravel")
