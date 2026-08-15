@@ -1,6 +1,6 @@
 """
 Video Clipper — professional local tool.
-Clip Generator (Groq + FFmpeg) + optional AI Content Advisor (Ollama).
+Clip Generator (Groq + local fallback) + optional AI Content Advisor.
 """
 
 from __future__ import annotations
@@ -23,167 +23,33 @@ from src.video_processor import VideoInfo, cut_video, get_video_info
 
 logger = logging.getLogger("video_clipper.app")
 
-st.set_page_config(
-    page_title="Video Clipper",
-    page_icon="▶",
-    layout="wide",
-    initial_sidebar_state="collapsed",
-)
+st.set_page_config(page_title="Video Clipper", page_icon="▶", layout="wide", initial_sidebar_state="collapsed")
 
-# ---------------------------------------------------------------------------
-# Design system (dark / editorial / media tool)
-# ---------------------------------------------------------------------------
 CSS = """
 <style>
 @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
-
-html, body, [class*="css"] {
-  font-family: 'Inter', system-ui, sans-serif;
-}
-
-.stApp {
-  background: #0a0a0b;
-  color: #e8e8ea;
-}
-
-/* Hide Streamlit chrome */
+html, body, [class*="css"] { font-family: 'Inter', system-ui, sans-serif; }
+.stApp { background: #0a0a0b; color: #e8e8ea; }
 #MainMenu, footer, header { visibility: hidden; height: 0; }
 [data-testid="stToolbar"] { display: none; }
-.block-container {
-  padding-top: 1.5rem !important;
-  padding-bottom: 3rem !important;
-  max-width: 1100px;
-}
-
-/* Typography */
-h1, h2, h3 { letter-spacing: -0.02em; font-weight: 600 !important; color: #f4f4f5 !important; }
-
-/* Accent */
-:root {
-  --accent: #c8f542;
-  --surface: #141416;
-  --border: #2a2a2e;
-  --muted: #8b8b93;
-}
-
-/* Cards */
-.vc-card {
-  background: var(--surface);
-  border: 1px solid var(--border);
-  border-radius: 12px;
-  padding: 1.25rem 1.5rem;
-  margin-bottom: 1rem;
-}
-.vc-label {
-  font-size: 0.7rem;
-  text-transform: uppercase;
-  letter-spacing: 0.08em;
-  color: var(--muted);
-  margin-bottom: 0.35rem;
-}
-.vc-value {
-  font-size: 1.05rem;
-  font-weight: 500;
-  color: #f4f4f5;
-}
+.block-container { padding-top: 1.5rem !important; max-width: 1100px; }
+h1,h2,h3 { letter-spacing: -0.02em; font-weight: 600 !important; color: #f4f4f5 !important; }
+:root { --accent: #c8f542; --surface: #141416; --border: #2a2a2e; --muted: #8b8b93; }
+.vc-card { background: var(--surface); border: 1px solid var(--border); border-radius: 12px; padding: 1.25rem 1.5rem; margin-bottom: 1rem; }
+.vc-label { font-size: 0.7rem; text-transform: uppercase; letter-spacing: 0.08em; color: var(--muted); margin-bottom: 0.35rem; }
+.vc-value { font-size: 1.05rem; font-weight: 500; color: #f4f4f5; }
 .vc-muted { color: var(--muted); font-size: 0.875rem; }
-.vc-accent { color: var(--accent); }
-
-.vc-header {
-  display: flex;
-  align-items: baseline;
-  justify-content: space-between;
-  margin-bottom: 1.5rem;
-  border-bottom: 1px solid var(--border);
-  padding-bottom: 1rem;
-}
-.vc-logo {
-  font-size: 1.15rem;
-  font-weight: 700;
-  letter-spacing: -0.03em;
-}
+.vc-header { display: flex; align-items: baseline; justify-content: space-between; margin-bottom: 1.5rem; border-bottom: 1px solid var(--border); padding-bottom: 1rem; }
+.vc-logo { font-size: 1.15rem; font-weight: 700; letter-spacing: -0.03em; }
 .vc-logo span { color: var(--accent); }
-
-.vc-section-title {
-  font-size: 0.75rem;
-  text-transform: uppercase;
-  letter-spacing: 0.1em;
-  color: var(--muted);
-  margin: 1.75rem 0 0.75rem;
-}
-
-/* Buttons */
-.stButton > button {
-  border-radius: 8px !important;
-  font-weight: 600 !important;
-  border: 1px solid var(--border) !important;
-  background: #1a1a1d !important;
-  color: #f4f4f5 !important;
-  transition: all 0.15s ease;
-}
-.stButton > button:hover {
-  border-color: var(--accent) !important;
-  color: var(--accent) !important;
-}
-.stButton > button[kind="primary"] {
-  background: var(--accent) !important;
-  color: #0a0a0b !important;
-  border-color: var(--accent) !important;
-}
-.stButton > button[kind="primary"]:hover {
-  filter: brightness(1.08);
-  color: #0a0a0b !important;
-}
-
-/* Inputs */
-.stTextInput input, .stSelectbox div[data-baseweb="select"] > div {
-  background: #0e0e10 !important;
-  border-radius: 8px !important;
-}
-
-/* Tabs */
-.stTabs [data-baseweb="tab-list"] {
-  gap: 0.5rem;
-  border-bottom: 1px solid var(--border);
-}
-.stTabs [data-baseweb="tab"] {
-  background: transparent;
-  color: var(--muted);
-  border-radius: 0;
-  font-weight: 500;
-}
-.stTabs [aria-selected="true"] {
-  color: var(--accent) !important;
-  border-bottom: 2px solid var(--accent);
-}
-
-/* Metrics strip */
-.vc-meta {
-  display: flex;
-  gap: 1.5rem;
-  flex-wrap: wrap;
-  margin: 0.75rem 0 1rem;
-}
+.vc-section-title { font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.1em; color: var(--muted); margin: 1.75rem 0 0.75rem; }
+.stButton > button { border-radius: 8px !important; font-weight: 600 !important; border: 1px solid var(--border) !important; background: #1a1a1d !important; color: #f4f4f5 !important; }
+.stButton > button[kind="primary"] { background: var(--accent) !important; color: #0a0a0b !important; border-color: var(--accent) !important; }
+.vc-meta { display: flex; gap: 1.5rem; flex-wrap: wrap; margin: 0.75rem 0 1rem; }
 .vc-meta-item .k { font-size: 0.65rem; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); }
 .vc-meta-item .v { font-size: 0.95rem; font-weight: 500; }
-
-/* Timeline bar */
-.vc-timeline {
-  height: 6px;
-  background: #1e1e22;
-  border-radius: 3px;
-  position: relative;
-  margin: 0.75rem 0 0.25rem;
-}
-.vc-timeline-fill {
-  position: absolute;
-  height: 100%;
-  background: var(--accent);
-  border-radius: 3px;
-  opacity: 0.85;
-}
-
-div[data-testid="stStatusWidget"] { display: none; }
+.vc-timeline { height: 6px; background: #1e1e22; border-radius: 3px; position: relative; margin: 0.75rem 0 0.25rem; }
+.vc-timeline-fill { position: absolute; height: 100%; background: var(--accent); border-radius: 3px; opacity: 0.85; }
 </style>
 """
 st.markdown(CSS, unsafe_allow_html=True)
@@ -191,20 +57,11 @@ st.markdown(CSS, unsafe_allow_html=True)
 
 def init_state() -> None:
     defaults = {
-        "video_path": None,
-        "video_name": None,
-        "video_info": None,
-        "transcription": None,
-        "candidate": None,
-        "clip_path": None,
-        "edited_path": None,
-        "manual_start": 0.0,
-        "manual_end": 40.0,
-        "cut_mode": "fast",
-        "source_url": "",
-        "webcam_path": None,
-        "content_pkg": None,
-        "advisor_enabled": True,
+        "video_path": None, "video_name": None, "video_info": None,
+        "transcription": None, "candidate": None, "clip_path": None,
+        "edited_path": None, "manual_start": 0.0, "manual_end": 40.0,
+        "source_url": "", "webcam_path": None, "content_pkg": None,
+        "prefer_local": True,  # default local to avoid Groq rate limits
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -240,7 +97,7 @@ def reset_pipeline() -> None:
 def copy_block(label: str, text: str, key: str) -> None:
     st.code(text or "—", language=None)
     st.download_button(
-        f"Copiar / baixar · {label}",
+        f"Download · {label}",
         data=(text or "").encode("utf-8"),
         file_name=f"{key}.txt",
         mime="text/plain",
@@ -249,54 +106,40 @@ def copy_block(label: str, text: str, key: str) -> None:
     )
 
 
-# ---------------------------------------------------------------------------
-# Header
-# ---------------------------------------------------------------------------
 st.markdown(
     '<div class="vc-header"><div class="vc-logo">VIDEO <span>CLIPPER</span></div>'
-    '<div class="vc-muted">Local · Groq speech · FFmpeg · Optional local advisor</div></div>',
+    '<div class="vc-muted">Local-first · Groq optional · FFmpeg · Ollama</div></div>',
     unsafe_allow_html=True,
 )
 
 ok_ffmpeg, _ = check_ffmpeg()
 col_s1, col_s2, col_s3 = st.columns(3)
 with col_s1:
-    st.markdown(
-        f'<div class="vc-card"><div class="vc-label">FFmpeg</div>'
-        f'<div class="vc-value">{"Online" if ok_ffmpeg else "Offline"}</div></div>',
-        unsafe_allow_html=True,
-    )
+    st.markdown(f'<div class="vc-card"><div class="vc-label">FFmpeg</div><div class="vc-value">{"Online" if ok_ffmpeg else "Offline"}</div></div>', unsafe_allow_html=True)
 with col_s2:
     try:
         require_api_key()
         groq_ok = True
     except RuntimeError:
         groq_ok = False
-    st.markdown(
-        f'<div class="vc-card"><div class="vc-label">Groq</div>'
-        f'<div class="vc-value">{"Ready" if groq_ok else "API key missing"}</div></div>',
-        unsafe_allow_html=True,
-    )
+    st.markdown(f'<div class="vc-card"><div class="vc-label">Groq</div><div class="vc-value">{"Ready" if groq_ok else "No key / optional"}</div></div>', unsafe_allow_html=True)
 with col_s3:
     ost = get_status(DEFAULT_VISION_MODEL)
-    st.markdown(
-        f'<div class="vc-card"><div class="vc-label">Content Advisor</div>'
-        f'<div class="vc-value">{"Connected" if ost.ready else ost.message or "Offline"}</div></div>',
-        unsafe_allow_html=True,
-    )
+    st.markdown(f'<div class="vc-card"><div class="vc-label">Ollama</div><div class="vc-value">{"Connected" if ost.ready else ost.message or "Offline"}</div></div>', unsafe_allow_html=True)
 
-# ---------------------------------------------------------------------------
-# Source
-# ---------------------------------------------------------------------------
+st.session_state.prefer_local = st.checkbox(
+    "Usar IA local (sem Groq) — recomendado se o limite da API estourar",
+    value=st.session_state.prefer_local,
+    help="Transcrição: faster-whisper local · Escolha do trecho: Ollama local",
+)
+
 st.markdown('<div class="vc-section-title">Source</div>', unsafe_allow_html=True)
 tab_up, tab_url = st.tabs(["File", "URL"])
 with tab_up:
-    uploaded = st.file_uploader("Video file", type=["mp4", "mov", "mkv", "webm"], label_visibility="collapsed")
+    uploaded = st.file_uploader("Video", type=["mp4", "mov", "mkv", "webm"], label_visibility="collapsed")
     if uploaded is not None:
         name = safe_filename(uploaded.name)
-        if st.session_state.video_name != name or not (
-            st.session_state.video_path and Path(st.session_state.video_path).exists()
-        ):
+        if st.session_state.video_name != name or not (st.session_state.video_path and Path(st.session_state.video_path).exists()):
             if st.session_state.video_path:
                 cleanup_file(Path(st.session_state.video_path))
             st.session_state.video_path = str(save_upload(uploaded))
@@ -324,12 +167,9 @@ if video_path and not video_path.exists():
     video_path = None
     st.session_state.video_path = None
 
-# ---------------------------------------------------------------------------
-# Clip Generator
-# ---------------------------------------------------------------------------
 if video_path:
     if st.session_state.video_info is None:
-        with st.spinner("Reading metadata…"):
+        with st.spinner("Metadata…"):
             st.session_state.video_info = get_video_info(video_path)
     info: VideoInfo = st.session_state.video_info
 
@@ -348,23 +188,28 @@ if video_path:
     if not ok_ffmpeg:
         st.warning("FFmpeg required.")
         st.stop()
-    if not groq_ok:
-        st.warning("Configure GROQ_API_KEY to find clips.")
-        st.stop()
+
+    prefer_local = st.session_state.prefer_local
+    if not prefer_local and not groq_ok:
+        st.warning("Sem Groq key — marque IA local ou configure a API key.")
 
     if st.button("Find best clip", type="primary", use_container_width=True):
         st.session_state.candidate = None
         st.session_state.clip_path = None
-        st.session_state.edited_path = None
         st.session_state.content_pkg = None
         status = st.status("Working…", expanded=True)
         try:
-            status.write("Transcribing audio (Groq Whisper)…")
-            transcription, audio_path = transcribe_video(video_path)
+            status.write("Transcribing…" + (" (local faster-whisper)" if prefer_local else " (Groq, fallback local se limite)"))
+            transcription, audio_path = transcribe_video(video_path, prefer_local=prefer_local)
             st.session_state.transcription = transcription
             cleanup_file(audio_path)
-            status.write("Selecting segment (Groq LLM)…")
-            cand = analyze_best_clip(transcription, video_duration=info.duration)
+            status.write(f"Transcription OK ({transcription.source}) · {len(transcription.segments)} segments")
+            status.write("Selecting segment…" + (" (Ollama local)" if prefer_local else " (Groq → Ollama se falhar)"))
+            cand = analyze_best_clip(
+                transcription,
+                video_duration=info.duration,
+                prefer_local=prefer_local,
+            )
             st.session_state.candidate = cand
             st.session_state.manual_start = cand.start
             st.session_state.manual_end = cand.end
@@ -388,9 +233,8 @@ if st.session_state.candidate and st.session_state.video_info:
         f'<div class="vc-meta-item"><div class="k">Start</div><div class="v">{format_timestamp(cand.start)}</div></div>'
         f'<div class="vc-meta-item"><div class="k">End</div><div class="v">{format_timestamp(cand.end)}</div></div>'
         f'<div class="vc-meta-item"><div class="k">Duration</div><div class="v">{cand.duration:.1f}s</div></div>'
-        f'<div class="vc-meta-item"><div class="k">Speech score</div><div class="v">{cand.score}/100</div></div>'
-        f'</div>'
-        f'<p class="vc-muted">{cand.reason}</p></div>',
+        f'<div class="vc-meta-item"><div class="k">Score</div><div class="v">{cand.score}/100</div></div>'
+        f'</div><p class="vc-muted">{cand.reason}</p></div>',
         unsafe_allow_html=True,
     )
 
@@ -406,11 +250,11 @@ if st.session_state.candidate and st.session_state.video_info:
     st.session_state.manual_start = new_start
     st.session_state.manual_end = new_end
 
-    mode = st.radio("Cut mode", ["fast", "precise"], horizontal=True, format_func=lambda x: "Fast copy" if x == "fast" else "Precise re-encode")
+    mode = st.radio("Cut mode", ["fast", "precise"], horizontal=True, format_func=lambda x: "Fast copy" if x == "fast" else "Precise")
     if st.button("Export clip", type="primary", use_container_width=True):
         OUTPUT_DIR.mkdir(exist_ok=True)
         out = OUTPUT_DIR / generate_output_filename()
-        with st.spinner("Cutting with FFmpeg…"):
+        with st.spinner("FFmpeg…"):
             try:
                 cut_video(Path(st.session_state.video_path), new_start, new_end, out, mode=mode)
                 st.session_state.clip_path = str(out)
@@ -420,9 +264,6 @@ if st.session_state.candidate and st.session_state.video_info:
             except Exception as e:
                 show_error(str(e))
 
-# ---------------------------------------------------------------------------
-# Clip preview + editor + Content Advisor
-# ---------------------------------------------------------------------------
 if st.session_state.clip_path and Path(st.session_state.clip_path).exists():
     clip_p = Path(st.session_state.clip_path)
     st.markdown('<div class="vc-section-title">Clip</div>', unsafe_allow_html=True)
@@ -430,15 +271,15 @@ if st.session_state.clip_path and Path(st.session_state.clip_path).exists():
     with clip_p.open("rb") as f:
         st.download_button("Download clip", f.read(), file_name=clip_p.name, mime="video/mp4", use_container_width=True)
 
-    with st.expander("Editor (9:16 · subtitles · webcam PiP)"):
+    with st.expander("Editor (9:16 · subs · webcam)"):
         vertical = st.checkbox("Vertical 9:16", True)
-        add_subs = st.checkbox("Burn-in subtitles", True)
-        cam = st.file_uploader("Webcam video (optional)", type=["mp4", "mov", "webm"], key="cam")
+        add_subs = st.checkbox("Subtitles", True)
+        cam = st.file_uploader("Webcam", type=["mp4", "mov", "webm"], key="cam")
         if cam:
             st.session_state.webcam_path = str(save_upload(cam, "webcam"))
         cam_pos = st.selectbox("Webcam position", list(PIP_POSITIONS.keys()))
         if st.button("Render edit", use_container_width=True):
-            tr: Optional[TranscriptionResult] = st.session_state.transcription
+            tr = st.session_state.transcription
             segs = tr.segments if tr else []
             opts = EditOptions(
                 vertical_9x16=vertical,
@@ -449,9 +290,7 @@ if st.session_state.clip_path and Path(st.session_state.clip_path).exists():
             with st.spinner("Rendering…"):
                 try:
                     edited = render_edited_clip(
-                        clip_p,
-                        opts,
-                        segments=segs,
+                        clip_p, opts, segments=segs,
                         clip_start_abs=float(st.session_state.manual_start),
                         clip_end_abs=float(st.session_state.manual_end),
                     )
@@ -464,99 +303,34 @@ if st.session_state.clip_path and Path(st.session_state.clip_path).exists():
             with ep.open("rb") as f:
                 st.download_button("Download edited", f.read(), file_name=ep.name, mime="video/mp4", use_container_width=True)
 
-    # ---- AI Content Advisor (optional, independent) ----
     st.markdown('<div class="vc-section-title">AI Content Advisor</div>', unsafe_allow_html=True)
-    st.markdown(
-        '<div class="vc-card"><p class="vc-muted">'
-        "Optional. Runs <b>locally</b> via Ollama. Does not change the cut. "
-        "Produces context, titles and platform-ready copy from the finished clip."
-        "</p></div>",
-        unsafe_allow_html=True,
-    )
-
-    if not ost.ready:
-        st.caption(f"Advisor offline: {ost.message}. Clip download still works.")
-    else:
-        if st.button("Analyze with local AI", use_container_width=True):
-            tr = st.session_state.transcription
-            segs = tr.segments if tr else []
-            text = tr.text if tr else ""
-            dur = max(1.0, float(st.session_state.manual_end - st.session_state.manual_start))
-            with st.spinner("Local model analyzing clip (may take 1–3 min)…"):
-                try:
-                    pkg = analyze_content(
-                        clip_path=clip_p,
-                        duration_sec=dur,
-                        segments=segs,
-                        full_text=text,
-                        use_vision=True,
-                        max_frames=2,
-                    )
-                    st.session_state.content_pkg = pkg
-                except Exception as e:
-                    show_error(str(e))
+    st.caption("Optional · local Ollama · does not change the cut")
+    if ost.ready and st.button("Analyze with local AI", use_container_width=True):
+        tr = st.session_state.transcription
+        with st.spinner("Local advisor…"):
+            try:
+                pkg = analyze_content(
+                    clip_path=clip_p,
+                    duration_sec=max(1.0, float(st.session_state.manual_end - st.session_state.manual_start)),
+                    segments=tr.segments if tr else [],
+                    full_text=tr.text if tr else "",
+                    use_vision=True,
+                    max_frames=2,
+                )
+                st.session_state.content_pkg = pkg
+            except Exception as e:
+                show_error(str(e))
 
     pkg: Optional[ContentPackage] = st.session_state.content_pkg
     if pkg:
-        st.markdown("#### Context")
         st.write(pkg.context.summary or "—")
-        m1, m2, m3 = st.columns(3)
-        m1.markdown(f"**Topic**  \n{pkg.context.topic}")
-        m2.markdown(f"**Tone**  \n{pkg.context.tone}")
-        m3.markdown(f"**Hook**  \n{pkg.context.hook}")
-        if pkg.context.key_points:
-            st.markdown("**Key points**")
-            for p in pkg.context.key_points:
-                st.markdown(f"- {p}")
-        if pkg.context.people or pkg.context.artists:
-            st.caption(
-                "People: " + ", ".join(pkg.context.people or ["Não identificado."])
-                + " · Artists: " + ", ".join(pkg.context.artists or ["Não identificado."])
-            )
+        copy_block("title", pkg.title.primary, "title")
+        t1, t2, t3 = st.tabs(["TikTok", "YouTube", "Instagram"])
+        with t1:
+            copy_block("TikTok", f"{pkg.tiktok.hook}\n\n{pkg.tiktok.caption}\n\n{' '.join(pkg.tiktok.hashtags)}", "tt")
+        with t2:
+            copy_block("YouTube", f"{pkg.youtube_shorts.title}\n\n{pkg.youtube_shorts.description}", "yt")
+        with t3:
+            copy_block("Instagram", f"{pkg.instagram_reels.caption}\n\n{' '.join(pkg.instagram_reels.hashtags)}", "ig")
 
-        st.markdown("#### Title")
-        copy_block("title", pkg.title.primary, "title_primary")
-        if pkg.title.alternatives:
-            st.caption("Alternatives")
-            for i, alt in enumerate(pkg.title.alternatives):
-                st.text(alt)
-
-        t_tt, t_yt, t_ig = st.tabs(["TikTok", "YouTube Shorts", "Instagram Reels"])
-        with t_tt:
-            body = (
-                f"Hook: {pkg.tiktok.hook}\n\n{pkg.tiktok.caption}\n\n"
-                f"{' '.join(pkg.tiktok.hashtags)}\n\nCTA: {pkg.tiktok.cta}\n"
-                f"Cover: {pkg.tiktok.cover_text}\n\nStrategy: {pkg.tiktok.strategy}"
-            )
-            copy_block("TikTok", body, "tiktok")
-        with t_yt:
-            body = (
-                f"{pkg.youtube_shorts.title}\n\n{pkg.youtube_shorts.description}\n\n"
-                f"{' '.join(pkg.youtube_shorts.hashtags)}\n"
-                f"Keywords: {', '.join(pkg.youtube_shorts.keywords)}\n"
-                f"CTA: {pkg.youtube_shorts.cta}"
-            )
-            copy_block("YouTube", body, "youtube")
-        with t_ig:
-            body = (
-                f"{pkg.instagram_reels.caption}\n\n{' '.join(pkg.instagram_reels.hashtags)}\n\n"
-                f"CTA: {pkg.instagram_reels.cta}\nCover: {pkg.instagram_reels.cover_text}\n"
-                f"Strategy: {pkg.instagram_reels.strategy}"
-            )
-            copy_block("Instagram", body, "instagram")
-
-        st.download_button(
-            "Download all copy",
-            data=pkg.copy_all_text().encode("utf-8"),
-            file_name="content_package.txt",
-            mime="text/plain",
-            use_container_width=True,
-        )
-        st.caption(f"Model {pkg.model} · {pkg.inference_ms} ms · frames {pkg.used_frames}")
-
-st.markdown(
-    '<p class="vc-muted" style="margin-top:2rem">'
-    "Clip selection uses Groq. Content Advisor is local and optional. Video files stay on your machine for FFmpeg and Ollama."
-    "</p>",
-    unsafe_allow_html=True,
-)
+st.caption("Local-first: faster-whisper + Ollama when enabled. Groq only if you uncheck local mode.")
