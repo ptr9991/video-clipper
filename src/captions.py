@@ -1,4 +1,4 @@
-"""Caption pipeline — VideoClipper Default only. Word-level, relative, max 2 lines."""
+"""Captions: relative word times, compact blocks, max 2 lines, centered style via preset."""
 
 from __future__ import annotations
 
@@ -53,16 +53,15 @@ def shift_words_to_clip(
     clip_start_abs: float,
     clip_duration: float,
 ) -> list[WordStamp]:
+    """original time → clip-relative (sync critical)."""
     out: list[WordStamp] = []
     for w in words:
-        if w.end < clip_start_abs or w.start > clip_start_abs + clip_duration:
+        if w.end < clip_start_abs - 0.05:
+            continue
+        if w.start > clip_start_abs + clip_duration + 0.05:
             continue
         rs = max(0.0, w.start - clip_start_abs)
-        re_ = min(clip_duration, max(rs + 0.02, w.end - clip_start_abs))
-        if re_ <= rs:
-            continue
-        text = re.sub(r"\s+", "", (w.word or "")).strip() or (w.word or "").strip()
-        # keep internal spaces for multi-token rare cases
+        re_ = min(clip_duration, max(rs + 0.05, w.end - clip_start_abs))
         text = (w.word or "").strip()
         if not text:
             continue
@@ -74,19 +73,13 @@ def _clean_word(w: str) -> str:
     return re.sub(r"\s+", " ", (w or "")).strip()
 
 
-def chunk_words(
-    words: list[WordStamp],
-    min_words: int | None = None,
-    max_words: int | None = None,
-    max_gap: float | None = None,
-    max_chars: int | None = None,
-) -> list:
+def chunk_words(words: list[WordStamp]) -> list:
     from src.editor.models import CaptionCue
 
-    min_words = min_words if min_words is not None else DEFAULT.min_words
-    max_words = max_words if max_words is not None else DEFAULT.max_words
-    max_gap = max_gap if max_gap is not None else 0.50
-    max_chars = max_chars if max_chars is not None else DEFAULT.max_chars_line * 2
+    min_words = DEFAULT.min_words
+    max_words = DEFAULT.max_words
+    max_gap = 0.45
+    max_chars = DEFAULT.max_chars_line * 2
 
     if not words:
         return []
@@ -103,16 +96,20 @@ def chunk_words(
             buf = []
             return
         text = balance_two_lines(toks, max_chars=DEFAULT.max_chars_line)
+        # timing tightly bound to spoken words (sync)
         start = buf[0].start
-        end = max(buf[-1].end, start + DEFAULT.min_words * 0.15)
-        # min readable duration
-        if end - start < 0.45:
-            end = start + 0.45
+        end = buf[-1].end
+        if end - start < 0.50:
+            end = start + 0.50
+        # don't let cue run long after last word
+        end = min(end, buf[-1].end + 0.15)
+        if end <= start:
+            end = start + 0.50
         cues.append(
             CaptionCue(
                 id=f"cap_{uuid.uuid4().hex[:8]}",
-                start=start,
-                end=end,
+                start=round(start, 3),
+                end=round(end, 3),
                 text=text,
                 highlight_words=[],
             )
@@ -125,14 +122,10 @@ def chunk_words(
             continue
         gap = w.start - buf[-1].end
         joined_len = sum(len(_clean_word(x.word)) + 1 for x in buf) + len(_clean_word(w.word))
-        punct_break = _clean_word(buf[-1].word)[-1:] in ".!?…"
-        if (
-            gap > max_gap
-            or len(buf) >= max_words
-            or joined_len > max_chars
-            or punct_break
-        ):
-            if len(buf) >= min_words or gap > max_gap or punct_break:
+        last = _clean_word(buf[-1].word)
+        punct = last[-1:] in ".!?…" if last else False
+        if gap > max_gap or len(buf) >= max_words or joined_len > max_chars or punct:
+            if len(buf) >= min_words or gap > max_gap or punct:
                 flush()
                 buf = [w]
             else:
@@ -150,11 +143,9 @@ def _fix_overlaps(cues: list) -> list:
     for c in cues[1:]:
         prev = fixed[-1]
         if c.start < prev.end:
-            mid = (prev.end + c.start) / 2
-            prev.end = max(prev.start + 0.25, min(prev.end, mid))
-            c.start = max(c.start, prev.end + 0.02)
+            prev.end = min(prev.end, max(prev.start + 0.3, c.start - 0.02))
             if c.end <= c.start:
-                c.end = c.start + 0.45
+                c.end = c.start + 0.5
         if c.end <= c.start:
             continue
         fixed.append(c)

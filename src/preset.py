@@ -1,49 +1,36 @@
 """
-VIDEOCLIPPER DEFAULT — single official visual standard for all exports.
-Deterministic. No style picker. No random sizing.
+VIDEOCLIPPER DEFAULT — single standard for all shorts.
+Captions: moderate size, bottom-center, max 2 lines.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 
-# Canvas
 CANVAS_W = 1080
 CANVAS_H = 1920
 ASPECT = "9:16"
 
-# Caption geometry (percent of canvas)
-CAPTION_MAX_WIDTH_RATIO = 0.82  # never touch edges
-CAPTION_BOTTOM_RATIO = 0.18     # center of text block from bottom (~safe)
-# ASS MarginV ≈ pixels from bottom
-CAPTION_MARGIN_V = int(CANVAS_H * CAPTION_BOTTOM_RATIO)  # ~346 → clamp usable
-# Practical ASS margin so text sits above TikTok/IG UI (~18–22% from bottom)
-CAPTION_MARGIN_V = 260
-
-# Font — ASS FontSize is NOT CSS px; keep moderate for 1080x1920
-CAPTION_FONT_SIZE = 42
+# ASS FontSize is large on 1080x1920 — keep SMALL
+# 24–28 reads well on phone without covering the speaker
+CAPTION_FONT_SIZE = 26
 CAPTION_FONT_NAME = "Arial"
 CAPTION_PRIMARY = "#FFFFFF"
-CAPTION_OUTLINE = 3
-CAPTION_BOLD = True
+CAPTION_OUTLINE = 2
+# Bottom-center, above platform UI (~14% from bottom)
+CAPTION_MARGIN_V = 200
 
-# Chunking
 MIN_WORDS = 2
-MAX_WORDS = 5
-MAX_CHARS_LINE = 28
+MAX_WORDS = 4
+MAX_CHARS_LINE = 22
 MAX_LINES = 2
-MIN_CUE_DURATION = 0.45
-MAX_GAP_BREAK = 0.50
+MIN_CUE_DURATION = 0.50
 
 
 def calculate_caption_size(canvas_w: int = CANVAS_W, canvas_h: int = CANVAS_H) -> int:
-    """
-    Stable ASS font size from canvas width.
-    Tuned so captions are readable on phone without dominating the frame.
-    """
-    # ~3.9% of width → ~42 at 1080
-    size = int(round(canvas_w * 0.039))
-    return max(32, min(48, size))
+    """~2.4% of width → 26 at 1080. Never huge."""
+    size = int(round(canvas_w * 0.024))
+    return max(22, min(28, size))
 
 
 @dataclass(frozen=True)
@@ -69,42 +56,40 @@ DEFAULT = VideoClipperDefault.create()
 
 
 def ass_force_style(p: VideoClipperDefault | None = None) -> str:
-    """FFmpeg subtitles force_style string — identical for every export."""
+    """Bottom-center, compact, high contrast — same every export."""
     p = p or DEFAULT
-    # ASS colour: &HAABBGGRR white opaque
     return (
         f"FontName={p.font_name},"
         f"FontSize={p.font_size},"
         f"PrimaryColour=&H00FFFFFF,"
         f"OutlineColour=&H00000000,"
+        f"BackColour=&H80000000,"
         f"BorderStyle=1,"
         f"Outline={p.outline},"
-        f"Shadow=1,"
+        f"Shadow=0,"
         f"Bold=1,"
-        f"Alignment=2,"  # bottom center
+        f"Alignment=2,"  # bottom-center
         f"MarginV={p.margin_v},"
-        f"MarginL=60,"
-        f"MarginR=60"
+        f"MarginL=80,"
+        f"MarginR=80,"
+        f"ScaleX=100,"
+        f"ScaleY=100"
     )
 
 
 def balance_two_lines(words: list[str], max_chars: int = MAX_CHARS_LINE) -> str:
-    """
-    Join words into at most 2 lines with ASS \\N, balanced lengths.
-    """
     if not words:
         return ""
     text = " ".join(words)
     if len(text) <= max_chars:
         return text.upper()
 
-    # find split near midpoint by word count
     best_i = max(1, len(words) // 2)
     best_score = 10**9
     for i in range(1, len(words)):
         left = " ".join(words[:i])
         right = " ".join(words[i:])
-        if len(left) > max_chars * 1.15 or len(right) > max_chars * 1.15:
+        if len(left) > max_chars + 4 or len(right) > max_chars + 4:
             continue
         score = abs(len(left) - len(right))
         if score < best_score:
