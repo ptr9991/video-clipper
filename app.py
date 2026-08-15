@@ -100,9 +100,6 @@ def reset_video_state() -> None:
     st.session_state.visual_result = None
 
 
-# ---------------------------------------------------------------------------
-# Sidebar: status + hardware + Ollama
-# ---------------------------------------------------------------------------
 with st.sidebar:
     st.header("⚙️ Status")
     ok_ffmpeg, ffmpeg_msg = check_ffmpeg()
@@ -188,9 +185,7 @@ with st.sidebar:
             del st.session_state[k]
         st.rerun()
 
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
+
 st.title("🎬 AI Video Clipper Local")
 st.markdown(
     "Upload ou link → **Groq** (fala) → **FFmpeg** (corte) → **Qwen local** (visão, opcional)."
@@ -367,7 +362,6 @@ if st.session_state.clip_path:
             data = f.read()
         st.download_button("⬇️ Baixar MP4", data, file_name=clip_p.name, mime="video/mp4", use_container_width=True)
 
-        # ---- Local visual AI ----
         st.divider()
         st.subheader("👁️ IA Visual Local (Qwen2.5-VL)")
         st.caption("Frames analisados **no seu PC**. Nada de vídeo é enviado à nuvem nesta etapa.")
@@ -382,7 +376,7 @@ if st.session_state.clip_path:
             )
         else:
             if st.button("🔍 Analisar clipe com IA local", type="secondary", use_container_width=True):
-                with st.spinner("Extraindo frames e analisando (pode levar 1–3 min na RTX 2070)…"):
+                with st.spinner("Extraindo frames e analisando (1–3 min na RTX 2070)…"):
                     try:
                         tr: Optional[TranscriptionResult] = st.session_state.transcription
                         segs: list[Segment] = tr.segments if tr else []
@@ -395,7 +389,7 @@ if st.session_state.clip_path:
                             clip_end_abs=float(st.session_state.manual_end),
                             segments=segs,
                             speech_score=speech,
-                            max_frames=10,
+                            max_frames=4,
                         )
                         st.session_state.visual_result = result
                     except Exception as exc:
@@ -425,7 +419,9 @@ if st.session_state.clip_path:
                 if vr.suggested_start is not None or vr.suggested_end is not None:
                     abs_start = float(st.session_state.manual_start) + float(vr.suggested_start or 0)
                     abs_end = float(st.session_state.manual_start) + float(
-                        vr.suggested_end if vr.suggested_end is not None else (st.session_state.manual_end - st.session_state.manual_start)
+                        vr.suggested_end
+                        if vr.suggested_end is not None
+                        else (st.session_state.manual_end - st.session_state.manual_start)
                     )
                     st.info(f"Sugestão de recorte: {abs_start:.1f}s → {abs_end:.1f}s")
                     colx, coly = st.columns(2)

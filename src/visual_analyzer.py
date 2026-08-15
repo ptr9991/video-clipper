@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 import logging
 import time
 from dataclasses import dataclass, field
@@ -17,28 +16,14 @@ from src.utils import extract_json_from_text
 
 log = logging.getLogger("video_clipper.visual")
 
-SYSTEM_PROMPT = """Você é um editor especialista em vídeos curtos (TikTok, Reels, Shorts).
-Analise as imagens (frames em ordem temporal) e a transcrição do clipe.
-Responda SOMENTE com JSON válido, sem markdown:
-{
-  "overall_score": 0-100,
-  "visual_hook_score": 0-100,
-  "retention_score": 0-100,
-  "composition_score": 0-100,
-  "emotion_score": 0-100,
-  "visual_quality_score": 0-100,
-  "context_match_score": 0-100,
-  "short_form_score": 0-100,
-  "verdict": "APPROVE",
-  "confidence": 0.0-1.0,
-  "problems": ["..."],
-  "strengths": ["..."],
-  "suggestions": ["..."],
-  "suggested_start": null,
-  "suggested_end": null
-}
-verdict deve ser APPROVE, REVIEW ou REJECT.
-suggested_start/end são offsets em segundos relativos ao clipe (ou null).
+# Keep low for 8 GB VRAM + default 4k context; images are expensive in tokens
+DEFAULT_MAX_FRAMES = 4
+DEFAULT_FRAME_WIDTH = 384
+
+SYSTEM_PROMPT = """Você analisa clipes curtos para TikTok/Reels/Shorts.
+Dado frames em ordem temporal + transcrição, responda SÓ JSON:
+{"overall_score":80,"visual_hook_score":80,"retention_score":80,"composition_score":80,"emotion_score":80,"visual_quality_score":80,"context_match_score":80,"short_form_score":80,"verdict":"APPROVE","confidence":0.8,"problems":[],"strengths":[],"suggestions":[],"suggested_start":null,"suggested_end":null}
+verdict: APPROVE|REVIEW|REJECT. suggested_* em segundos relativos ao clipe ou null.
 """
 
 
@@ -69,6 +54,7 @@ def _segments_for_clip(
     segments: list[Segment],
     clip_start: float,
     clip_end: float,
+    max_chars: int = 1200,
 ) -> str:
     lines = []
     for seg in segments:
@@ -76,8 +62,9 @@ def _segments_for_clip(
             continue
         rel_s = max(0.0, seg.start - clip_start)
         rel_e = max(0.0, seg.end - clip_start)
-        lines.append(f"[{rel_s:.1f}s–{rel_e:.1f}s] {seg.text}")
-    return "\n".join(lines) if lines else "(sem transcrição neste trecho)"
+        lines.append(f"[{rel_s:.1f}-{rel_e:.1f}s] {seg.text}")
+    text = "\n".join(lines) if lines else "(sem transcrição)"
+    return text[:max_chars]
 
 
 def _parse_visual_json(raw: str) -> dict[str, Any]:
@@ -136,9 +123,9 @@ def _to_analysis(data: dict[str, Any], raw: str, frames: int, ms: int) -> Visual
         short_form_score=gi("short_form_score"),
         verdict=verdict,
         confidence=max(0.0, min(1.0, gf("confidence", 0.7))),
-        problems=[str(p) for p in problems][:8],
-        strengths=[str(s) for s in strengths][:8],
-        suggestions=[str(s) for s in suggestions][:8],
+        problems=[str(p) for p in problems][:6],
+        strengths=[str(s) for s in strengths][:6],
+        suggestions=[str(s) for s in suggestions][:6],
         suggested_start=ss_f,
         suggested_end=se_f,
         raw=raw,
@@ -155,33 +142,37 @@ def analyze_clip_visual(
     segments: list[Segment],
     speech_score: float = 70.0,
     model: str = DEFAULT_VISION_MODEL,
-    max_frames: int = 10,
+    max_frames: int = DEFAULT_MAX_FRAMES,
 ) -> VisualAnalysis:
     """
-    Extract frames + call Ollama vision model.
-    Does not send video to any external server — only local Ollama.
+    Extract a few frames + call local Ollama vision model.
+    Tuned for RTX 2070 8GB (few frames, smaller resolution, higher num_ctx).
     """
     if not is_ollama_running():
         raise RuntimeError("Ollama não está em execução.")
 
-    frames = extract_frames(clip_path, duration=clip_duration, max_frames=max_frames, width=512)
+    frames = extract_frames(
+        clip_path,
+        duration=clip_duration,
+        max_frames=max_frames,
+        width=DEFAULT_FRAME_WIDTH,
+    )
     if not frames:
         raise RuntimeError("Não foi possível extrair frames do clipe.")
 
     transcript_block = _segments_for_clip(segments, clip_start_abs, clip_end_abs)
     user_text = (
-        f"Clipe de {clip_duration:.1f} segundos. Frames em ordem temporal.\n\n"
-        f"Transcrição:\n{transcript_block}\n\n"
-        "Avalie hook visual, retenção, composição, emoção, qualidade e match com a fala. "
-        "Responda só JSON."
+        f"Clipe {clip_duration:.0f}s. {len(frames)} frames em ordem.\n"
+        f"Fala:\n{transcript_block}\n"
+        "Avalie e responda só JSON."
     )
 
     t0 = time.time()
+    raw = ""
     try:
         import ollama
 
-        # Limit images to avoid VRAM blow-up on 8GB cards
-        image_paths = [str(p) for p in frames[:max_frames]]
+        image_paths = [str(p) for p in frames]
         response = ollama.chat(
             model=model,
             messages=[
@@ -194,24 +185,25 @@ def analyze_clip_visual(
             ],
             options={
                 "temperature": 0.1,
-                "num_predict": 800,
+                "num_predict": 500,
+                # Raise context so a few vision tokens fit (8GB card)
+                "num_ctx": 8192,
             },
             format="json",
         )
-        raw = response["message"]["content"] if isinstance(response, dict) else response.message.content
+        if isinstance(response, dict):
+            raw = response.get("message", {}).get("content", "") or ""
+        else:
+            raw = getattr(getattr(response, "message", None), "content", "") or ""
     except Exception as exc:
         cleanup_frames(frames)
         raise RuntimeError(f"Falha na IA visual local: {exc}") from exc
-    finally:
-        # Always free disk
-        pass
 
     ms = int((time.time() - t0) * 1000)
     try:
-        data = _parse_visual_json(raw or "")
-        analysis = _to_analysis(data, raw or "", len(frames), ms)
+        data = _parse_visual_json(raw)
+        analysis = _to_analysis(data, raw, len(frames), ms)
         analysis.final = combine_scores(speech_score, data)
-        # Prefer combined overall if available
         if analysis.final:
             analysis.overall_score = analysis.final.overall
             analysis.verdict = analysis.final.verdict
@@ -219,7 +211,7 @@ def analyze_clip_visual(
         cleanup_frames(frames)
 
     log.info(
-        "Visual analysis done: score=%d verdict=%s frames=%d ms=%d",
+        "Visual analysis: score=%d verdict=%s frames=%d ms=%d",
         analysis.overall_score,
         analysis.verdict,
         analysis.frames_used,
