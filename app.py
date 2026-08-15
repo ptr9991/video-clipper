@@ -2,12 +2,12 @@
 AI Video Clipper Local
 Streamlit application that finds the best 30-50s clip from a long video
 using Groq for transcription + analysis and FFmpeg for local cutting.
+Supports local upload and URL download via yt-dlp.
 """
 
 from __future__ import annotations
 
 import logging
-import shutil
 from pathlib import Path
 from typing import Optional
 
@@ -16,14 +16,14 @@ import streamlit as st
 from src.config import (
     DEBUG,
     MAX_CLIP_DURATION,
-    MIN_CLIP_DURATION,
     OUTPUT_DIR,
     TEMP_DIR,
     check_ffmpeg,
     require_api_key,
 )
 from src.clip_analyzer import ClipCandidate, analyze_best_clip
-from src.transcription import TranscriptionResult, transcribe_video
+from src.downloader import QUALITY_PRESETS, download_video
+from src.transcription import transcribe_video
 from src.utils import (
     cleanup_file,
     format_timestamp,
@@ -34,9 +34,6 @@ from src.video_processor import VideoInfo, cut_video, get_video_info
 
 logger = logging.getLogger("video_clipper.app")
 
-# ---------------------------------------------------------------------------
-# Page config
-# ---------------------------------------------------------------------------
 st.set_page_config(
     page_title="AI Video Clipper Local",
     page_icon="🎬",
@@ -44,9 +41,7 @@ st.set_page_config(
     initial_sidebar_state="collapsed",
 )
 
-# ---------------------------------------------------------------------------
-# Session state helpers
-# ---------------------------------------------------------------------------
+
 def init_state() -> None:
     defaults = {
         "video_path": None,
@@ -60,6 +55,7 @@ def init_state() -> None:
         "cut_mode": "fast",
         "error": None,
         "last_cut_error": None,
+        "source_url": "",
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -75,22 +71,25 @@ def show_error(msg: str) -> None:
 
 
 def save_uploaded_file(uploaded) -> Path:
-    """
-    Persist the uploaded file inside the app TEMP_DIR so it survives
-    Streamlit reruns and is not cleaned by the OS temp folder.
-    """
     TEMP_DIR.mkdir(parents=True, exist_ok=True)
     suffix = Path(uploaded.name).suffix.lower() or ".mp4"
     safe = safe_filename(Path(uploaded.name).stem) or "upload"
     dest = TEMP_DIR / f"upload_{safe}{suffix}"
-    # Overwrite previous upload of same name
     with dest.open("wb") as f:
         f.write(uploaded.getbuffer())
     return dest
 
 
+def reset_video_state() -> None:
+    st.session_state.video_info = None
+    st.session_state.transcription = None
+    st.session_state.candidate = None
+    st.session_state.clip_path = None
+    st.session_state.last_cut_error = None
+
+
 # ---------------------------------------------------------------------------
-# Sidebar – status & help
+# Sidebar
 # ---------------------------------------------------------------------------
 with st.sidebar:
     st.header("⚙️ Status")
@@ -100,28 +99,19 @@ with st.sidebar:
         st.caption(ffmpeg_msg)
     else:
         st.error("FFmpeg não encontrado")
-        st.markdown(
-            "Na versão instalada pelo **VideoClipperSetup.exe** o FFmpeg já vem embutido.\n\n"
-            "Se você está rodando pelo código-fonte, instale o FFmpeg ou defina FFMPEG_PATH."
-        )
 
     try:
         require_api_key()
         st.success("API Key configurada")
     except RuntimeError:
         st.warning("API Key não configurada")
-        st.markdown(
-            "Feche e abra o **Video Clipper** pelo atalho para informar a chave, "
-            "ou defina a variável de ambiente `GROQ_API_KEY`."
-        )
 
     st.divider()
-    st.caption("Modo padrão de corte: **rápido** (`-c copy`)")
+    st.caption("Fontes: upload local ou URL (yt-dlp)")
     if DEBUG:
         st.caption("DEBUG=true")
 
     if st.button("🗑️ Limpar sessão"):
-        # Clean temp video
         if st.session_state.video_path:
             cleanup_file(Path(st.session_state.video_path))
         for k in list(st.session_state.keys()):
@@ -130,55 +120,82 @@ with st.sidebar:
 
 
 # ---------------------------------------------------------------------------
-# Main UI
+# Main
 # ---------------------------------------------------------------------------
 st.title("🎬 AI Video Clipper Local")
 st.markdown(
-    "Faça upload de um vídeo longo → a IA encontra o melhor trecho de **30–50 segundos** → "
-    "você ajusta e baixa o clipe. **Todo o processamento de vídeo é local.**"
+    "Envie um vídeo **ou cole um link** (YouTube, etc.) → a IA encontra o melhor trecho de "
+    "**30–50 segundos** → você ajusta e baixa o clipe."
 )
 
-# ---- Upload ----
-uploaded = st.file_uploader(
-    "Selecione um vídeo",
-    type=["mp4", "mov", "mkv", "webm"],
-    help="Formatos suportados: MP4, MOV, MKV, WEBM",
-)
+tab_upload, tab_url = st.tabs(["📁 Upload de arquivo", "🔗 Link (YouTube / URL)"])
 
-if uploaded is not None:
-    name = safe_filename(uploaded.name)
-    # Save only when a new file is chosen
-    if st.session_state.video_name != name or not (
-        st.session_state.video_path and Path(st.session_state.video_path).exists()
-    ):
-        if st.session_state.video_path:
-            cleanup_file(Path(st.session_state.video_path))
-        path = save_uploaded_file(uploaded)
-        st.session_state.video_path = str(path)
-        st.session_state.video_name = name
-        st.session_state.video_info = None
-        st.session_state.transcription = None
-        st.session_state.candidate = None
-        st.session_state.clip_path = None
-        st.session_state.last_cut_error = None
+with tab_upload:
+    uploaded = st.file_uploader(
+        "Selecione um vídeo",
+        type=["mp4", "mov", "mkv", "webm"],
+        help="Formatos: MP4, MOV, MKV, WEBM",
+    )
+    if uploaded is not None:
+        name = safe_filename(uploaded.name)
+        if st.session_state.video_name != name or not (
+            st.session_state.video_path and Path(st.session_state.video_path).exists()
+        ):
+            if st.session_state.video_path:
+                cleanup_file(Path(st.session_state.video_path))
+            path = save_uploaded_file(uploaded)
+            st.session_state.video_path = str(path)
+            st.session_state.video_name = name
+            st.session_state.source_url = ""
+            reset_video_state()
 
-# ---- Work from session state (survives Streamlit reruns) ----
+with tab_url:
+    st.caption("Funciona com YouTube e dezenas de outros sites suportados pelo yt-dlp.")
+    url = st.text_input(
+        "Cole a URL do vídeo",
+        value=st.session_state.source_url,
+        placeholder="https://www.youtube.com/watch?v=...",
+        key="url_input",
+    )
+    quality = st.selectbox(
+        "Qualidade do download",
+        options=list(QUALITY_PRESETS.keys()),
+        index=2,  # 720p default
+        help="Qualidades menores = download mais rápido e arquivo menor.",
+    )
+    if st.button("⬇️ Baixar vídeo", type="primary", use_container_width=True, key="btn_download_url"):
+        if not url.strip():
+            st.warning("Cole uma URL válida.")
+        else:
+            with st.spinner(f"Baixando vídeo ({quality})… isso pode levar alguns minutos"):
+                try:
+                    if st.session_state.video_path:
+                        cleanup_file(Path(st.session_state.video_path))
+                    path = download_video(url.strip(), quality=quality)
+                    st.session_state.video_path = str(path)
+                    st.session_state.video_name = path.name
+                    st.session_state.source_url = url.strip()
+                    reset_video_state()
+                    st.success(f"Download concluído: {path.name}")
+                    st.rerun()
+                except Exception as exc:
+                    show_error(str(exc))
+
+# ---- Active video from session ----
 video_path: Optional[Path] = None
 if st.session_state.video_path:
     video_path = Path(st.session_state.video_path)
     if not video_path.exists():
-        st.warning("O arquivo de vídeo temporário foi perdido. Faça o upload novamente.")
+        st.warning("O arquivo de vídeo temporário foi perdido. Envie ou baixe novamente.")
         st.session_state.video_path = None
         st.session_state.video_name = None
         video_path = None
 
 if video_path is not None:
-    # Metadata
     if st.session_state.video_info is None:
         with st.spinner("Lendo metadados do vídeo..."):
             try:
-                info = get_video_info(video_path)
-                st.session_state.video_info = info
+                st.session_state.video_info = get_video_info(video_path)
             except Exception as exc:
                 show_error(f"Não foi possível ler o vídeo: {exc}")
                 st.stop()
@@ -186,10 +203,7 @@ if video_path is not None:
     info: VideoInfo = st.session_state.video_info
 
     col1, col2, col3, col4 = st.columns(4)
-    col1.metric(
-        "Arquivo",
-        (st.session_state.video_name or video_path.name)[:30],
-    )
+    col1.metric("Arquivo", (st.session_state.video_name or video_path.name)[:30])
     col2.metric("Tamanho", f"{info.size_mb:.1f} MB")
     col3.metric("Duração", format_timestamp(info.duration))
     col4.metric("Resolução", info.resolution if info.width else "—")
@@ -197,7 +211,7 @@ if video_path is not None:
     st.video(str(video_path))
 
     if not ok_ffmpeg:
-        st.warning("FFmpeg não encontrado. Na versão instalada ele já vem embutido.")
+        st.warning("FFmpeg não encontrado.")
         st.stop()
 
     try:
@@ -228,7 +242,7 @@ if video_path is not None:
             status.write(f"✅ Transcrição concluída ({len(transcription.segments)} segmentos)")
             progress.progress(55, text="Analisando com IA…")
 
-            status.write("3️⃣ Analisando transcrição para encontrar o melhor trecho…")
+            status.write("3️⃣ Analisando transcrição…")
             candidate = analyze_best_clip(transcription, video_duration=info.duration)
             st.session_state.candidate = candidate
             st.session_state.manual_start = candidate.start
@@ -243,7 +257,7 @@ if video_path is not None:
             show_error(str(exc))
             st.session_state.error = str(exc)
 
-# ---- Result & manual adjustment ----
+# ---- Result ----
 if st.session_state.candidate is not None and st.session_state.video_info is not None:
     cand: ClipCandidate = st.session_state.candidate
     info = st.session_state.video_info
@@ -262,10 +276,7 @@ if st.session_state.candidate is not None and st.session_state.video_info is not
         st.markdown(f"**Hook:** {cand.hook}")
 
     st.markdown("#### Ajuste manual (opcional)")
-    st.caption(
-        f"Limite máximo recomendado: {MAX_CLIP_DURATION}s. "
-        "O modo rápido (`-c copy`) pode ter pequena imprecisão no início por causa de keyframes."
-    )
+    st.caption(f"Limite máximo recomendado: {MAX_CLIP_DURATION}s.")
 
     max_dur = float(info.duration) if info.duration > 0 else 3600.0
     col_a, col_b = st.columns(2)
@@ -316,12 +327,11 @@ if st.session_state.candidate is not None and st.session_state.video_info is not
 
     duration = new_end - new_start
     if duration > MAX_CLIP_DURATION:
-        st.warning(f"Duração {duration:.1f}s > {MAX_CLIP_DURATION}s. Será limitado no corte.")
+        st.warning(f"Duração {duration:.1f}s > {MAX_CLIP_DURATION}s. Será limitado.")
         new_end = new_start + MAX_CLIP_DURATION
         duration = MAX_CLIP_DURATION
 
     st.info(f"**Duração do clipe:** {duration:.1f} segundos")
-
     st.session_state.manual_start = new_start
     st.session_state.manual_end = new_end
 
@@ -340,9 +350,7 @@ if st.session_state.candidate is not None and st.session_state.video_info is not
 
     if st.button("✂️ Gerar clipe", type="primary", use_container_width=True, key="btn_cut"):
         if not st.session_state.video_path or not Path(st.session_state.video_path).exists():
-            st.session_state.last_cut_error = (
-                "Arquivo de vídeo não encontrado. Faça o upload novamente."
-            )
+            st.session_state.last_cut_error = "Arquivo de vídeo não encontrado."
             st.rerun()
 
         OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -366,14 +374,12 @@ if st.session_state.candidate is not None and st.session_state.video_info is not
                 st.session_state.clip_path = None
                 show_error(str(exc))
 
-# ---- Preview & download ----
 if st.session_state.clip_path:
     clip_p = Path(st.session_state.clip_path)
     if clip_p.exists():
         st.divider()
         st.subheader("📺 Pré-visualização do clipe")
         st.video(str(clip_p))
-
         with clip_p.open("rb") as f:
             data = f.read()
         st.download_button(
@@ -382,7 +388,7 @@ if st.session_state.clip_path:
             file_name=clip_p.name,
             mime="video/mp4",
             use_container_width=True,
-            key="btn_download",
+            key="btn_download_clip",
         )
         st.caption(f"Arquivo salvo em: `{clip_p}`")
     else:
@@ -392,5 +398,5 @@ if st.session_state.clip_path:
 st.divider()
 st.caption(
     "Processamento de vídeo 100% local com FFmpeg. "
-    "Apenas o áudio é enviado à API Groq para transcrição e análise."
+    "Apenas o áudio é enviado à API Groq. Downloads via yt-dlp."
 )
