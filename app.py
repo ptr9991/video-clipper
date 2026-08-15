@@ -1,6 +1,4 @@
-"""
-Video Clipper — fast UX with safe defaults (CPU transcription, Groq preferred).
-"""
+"""Video Clipper — 9:16 editor + word-synced short-form captions."""
 
 from __future__ import annotations
 
@@ -12,6 +10,7 @@ from typing import Any, Optional
 import streamlit as st
 
 from src.cache import file_sha256, load_json, save_json
+from src.captions import WordStamp
 from src.clip_analyzer import ClipCandidate, analyze_best_clips
 from src.config import OUTPUT_DIR, TEMP_DIR, check_ffmpeg, require_api_key
 from src.downloader import QUALITY_PRESETS, download_video
@@ -31,7 +30,6 @@ from src.editor import (
     set_aspect,
     set_caption_style,
     set_crop,
-    set_playhead,
 )
 from src.editor.caption_styles import STYLES
 from src.local_ai.content_advisor import ContentPackage, analyze_content
@@ -71,12 +69,10 @@ def init_state() -> None:
         "video_hash": None, "transcription": None,
         "candidates": [], "selected_idx": None,
         "clip_path": None, "source_url": "",
-        "content_pkg": None,
-        # SAFE DEFAULT: Groq for speech, local only for optional advisor
-        "prefer_local": False,
+        "content_pkg": None, "prefer_local": False,
         "top_n": 5, "editor_open": False, "editor_history": None,
         "export_path": None, "perf_log": [], "burn_captions": True,
-        "editor_tool": "Trim",
+        "editor_tool": "Captions",
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -121,9 +117,11 @@ def transcription_from_cache(data: dict) -> TranscriptionResult:
         Segment(float(s["start"]), float(s["end"]), str(s["text"]))
         for s in data.get("segments") or []
     ]
+    words = [WordStamp.from_dict(w) for w in data.get("words") or []]
     return TranscriptionResult(
         text=str(data.get("text", "")),
         segments=segs,
+        words=words,
         language=data.get("language"),
         duration=data.get("duration"),
         source=str(data.get("source", "cache")),
@@ -137,27 +135,48 @@ def transcription_to_cache(tr: TranscriptionResult) -> dict:
         "duration": tr.duration,
         "source": tr.source,
         "segments": [{"start": s.start, "end": s.end, "text": s.text} for s in tr.segments],
+        "words": [w.to_dict() for w in (tr.words or [])],
     }
+
+
+def open_editor_for_candidate(cand: ClipCandidate, idx: int) -> None:
+    """Cut once + open 9:16 project with word-synced captions."""
+    OUTPUT_DIR.mkdir(exist_ok=True)
+    out = OUTPUT_DIR / generate_output_filename(prefix=f"clip{idx+1}")
+    with st.spinner("Preparando editor 9:16 + legendas…"):
+        cut_video(Path(st.session_state.video_path), cand.start, cand.end, out, mode="fast")
+    st.session_state.clip_path = str(out)
+    meta = get_video_info(out)
+    tr: Optional[TranscriptionResult] = st.session_state.transcription
+    proj = new_project_from_clip(
+        out,
+        duration=meta.duration or cand.duration,
+        fps=meta.fps or 30.0,
+        name=out.stem,
+        segments=tr.segments if tr else [],
+        clip_start_abs=cand.start,
+        transcription=tr,
+    )
+    # force 9:16 + captions on
+    assert proj.aspect == AspectRatio.VERTICAL_9_16
+    st.session_state.editor_history = HistoryStack(proj)
+    st.session_state.editor_open = True
+    st.session_state.export_path = None
+    st.session_state.burn_captions = True
+    st.session_state.editor_tool = "Captions"
 
 
 st.markdown(
     '<div class="vc-header"><div class="vc-logo">VIDEO <span>CLIPPER</span></div>'
-    '<div class="vc-muted">Seguro · CPU · Cache</div></div>',
+    '<div class="vc-muted">9:16 · Word captions · Safe zone</div></div>',
     unsafe_allow_html=True,
 )
 
 ok_ffmpeg, _ = check_ffmpeg()
 ost = get_status(DEFAULT_VISION_MODEL)
 
-st.warning(
-    "Se o PC reiniciar: feche o **Ollama** na bandeja do sistema antes de analisar. "
-    "Deixe **IA local** desmarcada (usa Groq, mais leve)."
-)
-
 st.session_state.prefer_local = st.checkbox(
-    "IA local (CPU) — so se Groq estiver no limite",
-    value=st.session_state.prefer_local,
-    help="Local usa Whisper tiny na CPU. Nunca usa a GPU na transcricao.",
+    "IA local (CPU) — so se Groq no limite", value=st.session_state.prefer_local
 )
 st.session_state.top_n = st.select_slider("Melhores momentos", options=[5, 10, 15], value=st.session_state.top_n)
 
@@ -203,7 +222,6 @@ if vpath:
         perf("Metadata", time.time() - t0)
     info: VideoInfo = st.session_state.video_info
 
-    # Hash only when analyzing (not on every page load) to avoid long freezes on big files
     st.markdown(
         f'<div class="vc-card"><span class="vc-muted">{st.session_state.video_name}</span> · '
         f'{format_timestamp(info.duration)} · {info.resolution if info.width else "—"}</div>',
@@ -222,7 +240,7 @@ if vpath:
         has_groq = False
 
     if not has_groq and not st.session_state.prefer_local:
-        st.info("Sem chave Groq: marque IA local (CPU) ou configure a API key.")
+        st.info("Sem chave Groq: marque IA local ou configure a API key.")
 
     if st.button("Encontrar melhores momentos", type="primary", use_container_width=True):
         reset_analysis()
@@ -231,24 +249,29 @@ if vpath:
         n = int(st.session_state.top_n)
         try:
             if not st.session_state.video_hash:
-                status.write("Calculando hash (cache)…")
+                status.write("Hash…")
                 t0 = time.time()
                 st.session_state.video_hash = file_sha256(vpath)
                 perf("Hash", time.time() - t0)
             vhash = st.session_state.video_hash
 
             cached_tr = load_json(vhash, "transcription")
+            # Invalidate old cache without words
+            if cached_tr and not cached_tr.get("words"):
+                cached_tr = None
+
             if cached_tr:
-                status.write("Transcricao (cache) — pulou etapa pesada")
+                status.write("Transcricao (cache com words)")
                 tr = transcription_from_cache(cached_tr)
             else:
-                status.write("Etapa 1/3 · Transcrevendo (Groq ou CPU — sem GPU)")
+                status.write("Etapa 1/3 · Transcricao word-level")
                 t0 = time.time()
                 tr, audio = transcribe_video(vpath, prefer_local=prefer)
                 cleanup_file(audio)
                 perf("Transcription", time.time() - t0)
                 save_json(vhash, "transcription", transcription_to_cache(tr))
             st.session_state.transcription = tr
+            status.write(f"Words: {len(tr.words)} · Segments: {len(tr.segments)}")
 
             cache_key = f"analysis_n{n}_{'local' if prefer else 'groq'}"
             cached_an = load_json(vhash, cache_key)
@@ -262,7 +285,7 @@ if vpath:
                 perf("Analysis", time.time() - t0)
                 save_json(vhash, cache_key, {"candidates": [c.to_dict() for c in cands]})
 
-            status.write("Etapa 3/3 · Thumbnails leves")
+            status.write("Etapa 3/3 · Thumbs")
             t0 = time.time()
             for c in cands:
                 extract_thumbnail(vpath, c.start + min(2.0, c.duration / 3), vhash)
@@ -292,48 +315,23 @@ if st.session_state.candidates:
                 st.image(str(thumb), use_container_width=True)
             st.markdown(
                 f"**#{i+1}** · `{format_timestamp(cand.start)} → {format_timestamp(cand.end)}`  \n"
-                f"Score **{cand.score}** · {cand.duration:.0f}s  \n"
-                f"{(cand.hook or cand.reason or cand.transcript_snip or '—')[:120]}"
+                f"Score **{cand.score}** · {cand.duration:.0f}s"
             )
-            b1, b2 = st.columns(2)
-            if b1.button("Preview", key=f"pv_{i}", use_container_width=True):
-                st.session_state.selected_idx = i
-            if b2.button("Editar", key=f"ed_{i}", use_container_width=True):
-                st.session_state.selected_idx = i
-                OUTPUT_DIR.mkdir(exist_ok=True)
-                out = OUTPUT_DIR / generate_output_filename(prefix=f"clip{i+1}")
-                with st.spinner("Cortando…"):
-                    cut_video(Path(st.session_state.video_path), cand.start, cand.end, out, mode="fast")
-                st.session_state.clip_path = str(out)
-                meta = get_video_info(out)
-                tr = st.session_state.transcription
-                proj = new_project_from_clip(
-                    out,
-                    duration=meta.duration or cand.duration,
-                    fps=meta.fps or 30.0,
-                    name=out.stem,
-                    segments=tr.segments if tr else [],
-                    clip_start_abs=cand.start,
-                )
-                st.session_state.editor_history = HistoryStack(proj)
-                st.session_state.editor_open = True
-                st.session_state.export_path = None
+            if st.button("Abrir editor 9:16", key=f"ed_{i}", type="primary", use_container_width=True):
+                open_editor_for_candidate(cand, i)
                 st.rerun()
-
-    if st.session_state.selected_idx is not None:
-        idx = int(st.session_state.selected_idx)
-        if 0 <= idx < len(st.session_state.candidates):
-            cand = st.session_state.candidates[idx]
-            st.markdown(f"### Preview #{idx+1}")
-            st.info(f"{format_timestamp(cand.start)} → {format_timestamp(cand.end)}")
-            st.video(str(st.session_state.video_path), start_time=int(cand.start))
 
 if st.session_state.editor_open and st.session_state.editor_history and st.session_state.clip_path:
     hist: HistoryStack = st.session_state.editor_history
     state = hist.current
     clip_p = Path(st.session_state.clip_path)
 
-    st.markdown('<div class="vc-section">Editor</div>', unsafe_allow_html=True)
+    st.markdown(
+        f'<div class="vc-section">Editor · {state.aspect.value} · '
+        f'{len(state.captions)} legendas · style={state.caption_style.name}</div>',
+        unsafe_allow_html=True,
+    )
+
     u1, u2, u3, u4 = st.columns(4)
     if u1.button("Undo", disabled=not hist.can_undo()):
         hist.undo()
@@ -349,17 +347,42 @@ if st.session_state.editor_open and st.session_state.editor_history and st.sessi
         st.rerun()
 
     st.markdown(render_timeline_html(state), unsafe_allow_html=True)
-    tools = ["Trim", "Split", "Crop", "Audio", "Captions", "Text", "Export"]
+
+    tools = ["Captions", "Trim", "Split", "Crop", "Audio", "Text", "Export"]
     st.session_state.editor_tool = st.radio(
         "Tool", tools, horizontal=True, label_visibility="collapsed",
         index=tools.index(st.session_state.editor_tool) if st.session_state.editor_tool in tools else 0,
     )
     tool = st.session_state.editor_tool
-    left, right = st.columns([1.3, 1])
+
+    left, right = st.columns([1.2, 1])
     with left:
+        st.caption("Preview do clipe (export aplica 9:16 + legendas)")
         st.video(str(clip_p))
     with right:
-        if tool == "Trim":
+        if tool == "Captions":
+            st.caption("Legendas word-level convertidas para o tempo do clipe (0s = inicio do corte).")
+            st.session_state.burn_captions = st.checkbox("Queimar no export", True)
+            style_opts = ["default_shorts"] + list(STYLES.keys())
+            cur = state.caption_style.name
+            if cur not in style_opts:
+                cur = "default_shorts"
+            style = st.selectbox("Estilo", style_opts, index=style_opts.index(cur))
+            if style != state.caption_style.name:
+                hist.push(set_caption_style(state, style))
+                st.rerun()
+            for i, cap in enumerate(state.captions[:30]):
+                nt = st.text_input(
+                    f"{cap.start:.2f}–{cap.end:.2f}s",
+                    cap.text,
+                    key=f"cap{cap.id}",
+                )
+                if nt != cap.text:
+                    s = state.clone()
+                    s.captions[i].text = nt
+                    hist.push(s)
+                    st.rerun()
+        elif tool == "Trim":
             a = st.number_input("Start", 0.0, state.source_duration, float(state.playable_range.start), 0.05)
             b = st.number_input("End", 0.0, state.source_duration, float(state.playable_range.end), 0.05)
             if st.button("Aplicar trim") and b > a:
@@ -388,35 +411,18 @@ if st.session_state.editor_open and st.session_state.editor_history and st.sessi
         elif tool == "Audio":
             vol = st.slider("Volume", 0.0, 2.0, float(state.audio.volume), 0.05)
             muted = st.checkbox("Mudo", state.audio.muted)
-            fi = st.number_input("Fade in", 0.0, 5.0, float(state.audio.fade_in), 0.1)
-            fo = st.number_input("Fade out", 0.0, 5.0, float(state.audio.fade_out), 0.1)
             if st.button("Aplicar audio"):
                 s = state.clone()
-                s.audio = AudioSettings(vol, muted, fi, fo)
+                s.audio = AudioSettings(vol, muted, 0.0, 0.0)
                 hist.push(s)
                 st.rerun()
-        elif tool == "Captions":
-            names = list(STYLES.keys())
-            cur = state.caption_style.name if state.caption_style.name in names else "clean"
-            style = st.selectbox("Estilo", names, index=names.index(cur))
-            if style != state.caption_style.name:
-                hist.push(set_caption_style(state, style))
-                st.rerun()
-            st.session_state.burn_captions = st.checkbox("Queimar legendas", st.session_state.burn_captions)
-            for i, cap in enumerate(state.captions[:20]):
-                nt = st.text_input(f"{cap.start:.1f}s", cap.text, key=f"cap{cap.id}")
-                if nt != cap.text:
-                    s = state.clone()
-                    s.captions[i].text = nt
-                    hist.push(s)
-                    st.rerun()
         elif tool == "Text":
             tx = st.text_input("Texto", "TITULO")
-            ty = st.slider("Y", 0.0, 1.0, 0.12)
             if st.button("Add texto"):
-                hist.push(add_text_overlay(state, tx, end=state.timeline_duration, y=ty))
+                hist.push(add_text_overlay(state, tx, end=state.timeline_duration))
                 st.rerun()
         elif tool == "Export":
+            st.caption("Export: 1080x1920 · H.264 · legendas queimadas na safe zone")
             if st.button("EXPORTAR MP4", type="primary", use_container_width=True):
                 OUTPUT_DIR.mkdir(exist_ok=True)
                 out = OUTPUT_DIR / generate_output_filename(prefix="final")
@@ -426,9 +432,9 @@ if st.session_state.editor_open and st.session_state.editor_history and st.sessi
                     bar.progress(min(1.0, p), text=msg)
 
                 try:
-                    run_export(hist.current, out, burn_captions=st.session_state.burn_captions, progress=cb)
+                    run_export(hist.current, out, burn_captions=True, progress=cb)
                     st.session_state.export_path = str(out)
-                    st.success("OK")
+                    st.success("Export OK · 9:16")
                 except Exception as e:
                     err(str(e))
 
@@ -437,22 +443,5 @@ if st.session_state.editor_open and st.session_state.editor_history and st.sessi
         st.video(str(ep))
         with ep.open("rb") as f:
             st.download_button("Baixar final", f.read(), file_name=ep.name, mime="video/mp4", use_container_width=True)
-        if ost.ready and st.button("AI Content Advisor"):
-            tr = st.session_state.transcription
-            with st.spinner("Ollama…"):
-                try:
-                    st.session_state.content_pkg = analyze_content(
-                        ep, hist.current.timeline_duration,
-                        segments=tr.segments if tr else [],
-                        full_text=tr.text if tr else "",
-                        use_vision=False,
-                        max_frames=0,
-                    )
-                except Exception as e:
-                    err(str(e))
-        pkg = st.session_state.content_pkg
-        if pkg:
-            st.write(pkg.context.summary)
-            st.markdown(f"**{pkg.title.primary}**")
 
-st.caption("Padrao seguro: Groq na fala · sem GPU na etapa 1 · feche o Ollama se o PC travar")
+st.caption("9:16 padrao · legendas word-level relativas ao clipe · cache invalida sem words")
