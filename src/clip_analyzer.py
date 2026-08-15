@@ -1,4 +1,4 @@
-"""Intelligent clip selection using Groq LLM."""
+"""Intelligent clip selection — Groq LLM with local Ollama fallback."""
 
 from __future__ import annotations
 
@@ -110,20 +110,15 @@ def _density_fallback(
     video_duration: float,
     target: float = 40.0,
 ) -> ClipCandidate:
-    """
-    Heuristic fallback: pick the continuous window with the highest
-    word density that is ~30-50 seconds long.
-    """
     segments = transcription.segments
     if not segments:
-        # No segments — take middle of the video
         start = max(0.0, video_duration / 2 - target / 2)
         end = min(video_duration, start + target)
         return ClipCandidate(
             start=start,
             end=end,
             duration=end - start,
-            reason="Fallback automático (janela central) – a IA não retornou JSON válido.",
+            reason="Fallback automático (janela central).",
             hook="",
             score=50,
         )
@@ -145,7 +140,6 @@ def _density_fallback(
             duration = window_end - window_start
             if duration < MIN_CLIP_DURATION:
                 continue
-            # Prefer windows near target length with high density
             density = word_count / max(duration, 1.0)
             length_bonus = 1.0 - abs(duration - target) / target
             score = density * (0.7 + 0.3 * max(0.0, length_bonus))
@@ -165,10 +159,7 @@ def _density_fallback(
         start=best_start,
         end=best_end,
         duration=best_end - best_start,
-        reason=(
-            "Seleção automática por densidade de fala "
-            "(a resposta da IA não veio em JSON válido)."
-        ),
+        reason="Seleção por densidade de fala (fallback).",
         hook="",
         score=55,
     )
@@ -201,16 +192,22 @@ def analyze_best_clip(
     transcription: TranscriptionResult,
     video_duration: float,
     model: str = ANALYSIS_MODEL,
+    prefer_local: bool = False,
 ) -> ClipCandidate:
     """
-    Send the transcription to a Groq LLM and obtain the best 30-50s clip.
-    Falls back to a density heuristic if JSON parsing fails twice.
+    Prefer Groq; on rate-limit / connection failure use local Ollama.
+    Set prefer_local=True to skip Groq analysis entirely.
     """
     if not transcription.segments and not transcription.text:
         raise ValueError("Transcrição vazia – não é possível analisar.")
 
     if video_duration <= 0:
         raise ValueError("Duração do vídeo inválida.")
+
+    if prefer_local:
+        from src.local_ai.clip_selector import analyze_best_clip_local
+
+        return analyze_best_clip_local(transcription, video_duration)
 
     if transcription.segments:
         content = _build_segments_text(transcription.segments)
@@ -227,69 +224,67 @@ def analyze_best_clip(
         "Escolha o melhor trecho de 30 a 50 segundos. Responda só com JSON."
     )
 
-    client = Groq(api_key=require_api_key())
-    log.info("Sending analysis request to model=%s", model)
-
-    raw = ""
     try:
-        # Attempt 1: JSON mode
+        client = Groq(api_key=require_api_key())
+        log.info("Sending analysis request to Groq model=%s", model)
+
         try:
             raw = _call_llm(client, model, user_prompt, use_json_mode=True)
         except APIError:
-            # Some models may not support response_format — retry without it
-            log.warning("JSON mode not supported, retrying without response_format")
             raw = _call_llm(client, model, user_prompt, use_json_mode=False)
 
-        log.debug("LLM raw response: %s", raw[:500])
         data = extract_json_from_text(raw)
-
-        # Attempt 2: stricter re-prompt if parse failed
         if data is None:
-            log.warning("First parse failed, retrying with stricter prompt")
-            strict_prompt = (
-                user_prompt
-                + "\n\nIMPORTANTE: responda APENAS o objeto JSON, nada mais."
+            raw = _call_llm(
+                client,
+                model,
+                user_prompt + "\n\nAPENAS JSON.",
+                use_json_mode=False,
             )
-            try:
-                raw = _call_llm(client, model, strict_prompt, use_json_mode=True)
-            except APIError:
-                raw = _call_llm(client, model, strict_prompt, use_json_mode=False)
             data = extract_json_from_text(raw)
 
         if data is None:
-            log.error("Could not parse JSON from LLM: %s", raw[:400])
-            candidate = _density_fallback(transcription, video_duration)
-            candidate.raw_response = raw
-            return candidate
+            log.warning("Groq JSON failed — trying local Ollama")
+            from src.local_ai.clip_selector import analyze_best_clip_local
+
+            return analyze_best_clip_local(transcription, video_duration)
 
         candidate = _validate_candidate(data, video_duration)
         candidate.raw_response = raw
-        log.info(
-            "Best clip selected: %.2f – %.2f (%.1fs) score=%d",
-            candidate.start,
-            candidate.end,
-            candidate.duration,
-            candidate.score,
-        )
         return candidate
+
+    except RateLimitError:
+        log.warning("Groq rate limit — local Ollama fallback")
+        from src.local_ai.clip_selector import analyze_best_clip_local
+
+        cand = analyze_best_clip_local(transcription, video_duration)
+        cand.reason = (cand.reason or "") + " [Groq limite → Ollama local]"
+        return cand
+
+    except APIConnectionError:
+        log.warning("Groq connection failed — local fallback")
+        from src.local_ai.clip_selector import analyze_best_clip_local
+
+        return analyze_best_clip_local(transcription, video_duration)
 
     except AuthenticationError as exc:
         raise RuntimeError("Chave da API Groq inválida.") from exc
-    except RateLimitError as exc:
-        raise RuntimeError(
-            "Limite de requisições da API Groq atingido. Tente novamente mais tarde."
-        ) from exc
-    except APIConnectionError as exc:
-        raise RuntimeError("Falha de conexão com a API Groq.") from exc
+
     except APIError as exc:
-        raise RuntimeError(f"Erro da API Groq: {exc}") from exc
+        # Any other API error: try local before giving up
+        log.warning("Groq API error %s — local fallback", exc)
+        try:
+            from src.local_ai.clip_selector import analyze_best_clip_local
+
+            return analyze_best_clip_local(transcription, video_duration)
+        except Exception:
+            raise RuntimeError(f"Erro da API Groq: {exc}") from exc
 
 
 def parse_and_validate_json(
     text: str,
     video_duration: float,
 ) -> ClipCandidate:
-    """Public helper used by unit tests."""
     data = extract_json_from_text(text)
     if data is None:
         raise ValueError("JSON inválido")
