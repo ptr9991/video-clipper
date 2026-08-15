@@ -41,7 +41,6 @@ def _base_opts(out_dir: Path, fmt: str) -> dict[str, Any]:
         "fragment_retries": 5,
         "file_access_retries": 3,
         "concurrent_fragment_downloads": 1,
-        # Reduce 403 from YouTube by preferring mobile clients
         "extractor_args": {
             "youtube": {
                 "player_client": ["android", "ios", "web"],
@@ -98,22 +97,20 @@ def download_video(
         import yt_dlp
     except ImportError as exc:
         raise RuntimeError(
-            "yt-dlp não está instalado. No PowerShell:\n"
-            r'& "$env:LOCALAPPDATA\VideoClipper\runtime\python\python.exe" -m pip install -U yt-dlp'
+            "yt-dlp nao esta instalado. No PowerShell execute: "
+            "python -m pip install -U yt-dlp"
         ) from exc
 
     url = (url or "").strip()
     if not url:
         raise ValueError("URL vazia.")
     if not url.startswith(("http://", "https://")):
-        raise ValueError("URL inválida. Cole um link completo (https://...).")
+        raise ValueError("URL invalida. Cole um link completo (https://...).")
 
     out_dir = output_dir or TEMP_DIR
     out_dir.mkdir(parents=True, exist_ok=True)
     fmt = QUALITY_PRESETS.get(quality, QUALITY_PRESETS["720p"])
 
-    # Attempt 1: preferred quality + mobile clients
-    # Attempt 2: progressive single-file (often avoids 403 on fragments)
     attempts = [
         _base_opts(out_dir, fmt),
         {
@@ -133,14 +130,13 @@ def download_video(
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 info = ydl.extract_info(url, download=True)
                 if info is None:
-                    raise RuntimeError("Não foi possível obter informações do vídeo.")
+                    raise RuntimeError("Nao foi possivel obter informacoes do video.")
                 path = _resolve_path(ydl, info, out_dir)
                 log.info("Downloaded: %s (%.1f MB)", path.name, path.stat().st_size / 1e6)
                 return path
         except yt_dlp.utils.DownloadError as exc:
             last_err = str(exc)
             log.warning("Attempt %d failed: %s", i, last_err[:200])
-            # try next strategy
             continue
         except Exception as exc:
             last_err = str(exc)
@@ -151,16 +147,13 @@ def download_video(
     low = msg.lower()
     if "403" in msg or "forbidden" in low:
         raise RuntimeError(
-            "YouTube bloqueou o download (HTTP 403).\n\n"
-            "Tente isto:\n"
-            "1) Atualizar yt-dlp:\n"
-            r'   & "$env:LOCALAPPDATA\VideoClipper\runtime\python\python.exe" -m pip install -U yt-dlp'\n"
-            "2) Usar qualidade 360p ou 480p\n"
-            "3) Baixar o MP4 no navegador e usar a aba Arquivo\n"
-            f"\nDetalhe: {msg[:250]}"
+            "YouTube bloqueou o download (HTTP 403). "
+            "Atualize o yt-dlp com: python -m pip install -U yt-dlp. "
+            "Ou use qualidade 360p/480p, ou baixe o MP4 no navegador e use a aba Arquivo. "
+            "Detalhe: " + msg[:250]
         )
     if "private" in low:
-        raise RuntimeError("Vídeo privado — não pode ser baixado.")
+        raise RuntimeError("Video privado — nao pode ser baixado.")
     if "age" in low:
-        raise RuntimeError("Restrição de idade — não foi possível baixar.")
-    raise RuntimeError(f"Falha no download: {msg[:350]}")
+        raise RuntimeError("Restricao de idade — nao foi possivel baixar.")
+    raise RuntimeError("Falha no download: " + msg[:350])
