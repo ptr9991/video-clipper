@@ -1,6 +1,5 @@
 """
-Video Clipper — fast UX:
-upload → immediate preview → one transcription → TOP-N candidates → grid → edit/export
+Video Clipper — fast UX with safe defaults (CPU transcription, Groq preferred).
 """
 
 from __future__ import annotations
@@ -11,11 +10,10 @@ from pathlib import Path
 from typing import Any, Optional
 
 import streamlit as st
-import streamlit.components.v1 as components
 
 from src.cache import file_sha256, load_json, save_json
 from src.clip_analyzer import ClipCandidate, analyze_best_clips
-from src.config import MAX_CLIP_DURATION, OUTPUT_DIR, TEMP_DIR, check_ffmpeg, require_api_key
+from src.config import OUTPUT_DIR, TEMP_DIR, check_ffmpeg, require_api_key
 from src.downloader import QUALITY_PRESETS, download_video
 from src.editor import (
     AspectRatio,
@@ -62,12 +60,6 @@ html, body, [class*="css"] { font-family: Inter, system-ui, sans-serif; }
 .vc-muted{color:#8a8a8a;font-size:.85rem;}
 .stButton>button{border-radius:8px!important;font-weight:600!important;background:#161616!important;border:1px solid #2a2a2a!important;color:#f5f5f5!important;}
 .stButton>button[kind="primary"]{background:#c8f542!important;color:#080808!important;border-color:#c8f542!important;}
-.clip-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(240px,1fr));gap:12px;}
-.clip-card{background:#111;border:1px solid #2a2a2a;border-radius:10px;overflow:hidden;}
-.clip-card img{width:100%;aspect-ratio:16/9;object-fit:cover;background:#000;display:block;}
-.clip-body{padding:10px 12px;}
-.clip-score{color:#c8f542;font-weight:700;font-size:.9rem;}
-.clip-time{color:#8a8a8a;font-size:.75rem;}
 </style>
 """
 st.markdown(CSS, unsafe_allow_html=True)
@@ -79,7 +71,9 @@ def init_state() -> None:
         "video_hash": None, "transcription": None,
         "candidates": [], "selected_idx": None,
         "clip_path": None, "source_url": "",
-        "content_pkg": None, "prefer_local": True,
+        "content_pkg": None,
+        # SAFE DEFAULT: Groq for speech, local only for optional advisor
+        "prefer_local": False,
         "top_n": 5, "editor_open": False, "editor_history": None,
         "export_path": None, "perf_log": [], "burn_captions": True,
         "editor_tool": "Trim",
@@ -146,38 +140,31 @@ def transcription_to_cache(tr: TranscriptionResult) -> dict:
     }
 
 
-def interval_preview_html(src: str, start: float, end: float, height: int = 280) -> None:
-    """HTML5 video: seek to start, pause at end — no extra MP4."""
-    components.html(
-        f"""
-        <video id="vp" src="{src}" controls style="width:100%;max-height:{height}px;background:#000;border-radius:8px"></video>
-        <script>
-        const v = document.getElementById('vp');
-        const start = {start:.3f}, end = {end:.3f};
-        v.addEventListener('loadedmetadata', () => {{ v.currentTime = start; }});
-        v.addEventListener('timeupdate', () => {{ if (v.currentTime >= end) {{ v.pause(); v.currentTime = end; }} }});
-        </script>
-        """,
-        height=height + 20,
-    )
-
-
 st.markdown(
     '<div class="vc-header"><div class="vc-logo">VIDEO <span>CLIPPER</span></div>'
-    '<div class="vc-muted">Rápido · TOP-N · Cache local</div></div>',
+    '<div class="vc-muted">Seguro · CPU · Cache</div></div>',
     unsafe_allow_html=True,
 )
 
 ok_ffmpeg, _ = check_ffmpeg()
 ost = get_status(DEFAULT_VISION_MODEL)
-st.session_state.prefer_local = st.checkbox("IA local", value=st.session_state.prefer_local)
-st.session_state.top_n = st.select_slider("Quantos melhores momentos", options=[5, 10, 15], value=st.session_state.top_n)
 
-# ── Upload / URL ─────────────────────────────────────────
+st.warning(
+    "Se o PC reiniciar: feche o **Ollama** na bandeja do sistema antes de analisar. "
+    "Deixe **IA local** desmarcada (usa Groq, mais leve)."
+)
+
+st.session_state.prefer_local = st.checkbox(
+    "IA local (CPU) — so se Groq estiver no limite",
+    value=st.session_state.prefer_local,
+    help="Local usa Whisper tiny na CPU. Nunca usa a GPU na transcricao.",
+)
+st.session_state.top_n = st.select_slider("Melhores momentos", options=[5, 10, 15], value=st.session_state.top_n)
+
 st.markdown('<div class="vc-section">Source</div>', unsafe_allow_html=True)
 tab_f, tab_u = st.tabs(["Arquivo", "URL"])
 with tab_f:
-    up = st.file_uploader("Vídeo", type=["mp4", "mov", "mkv", "webm"], label_visibility="collapsed")
+    up = st.file_uploader("Video", type=["mp4", "mov", "mkv", "webm"], label_visibility="collapsed")
     if up is not None:
         name = safe_filename(up.name)
         if st.session_state.video_name != name or not (st.session_state.video_path and Path(st.session_state.video_path).exists()):
@@ -210,44 +197,52 @@ if vpath and not vpath.exists():
     vpath = None
 
 if vpath:
-    # Immediate preview + fast metadata
     t0 = time.time()
     if st.session_state.video_info is None:
         st.session_state.video_info = get_video_info(vpath)
         perf("Metadata", time.time() - t0)
     info: VideoInfo = st.session_state.video_info
 
-    if not st.session_state.video_hash:
-        t0 = time.time()
-        st.session_state.video_hash = file_sha256(vpath)
-        perf("Hash", time.time() - t0)
-
+    # Hash only when analyzing (not on every page load) to avoid long freezes on big files
     st.markdown(
         f'<div class="vc-card"><span class="vc-muted">{st.session_state.video_name}</span> · '
         f'{format_timestamp(info.duration)} · {info.resolution if info.width else "—"}</div>',
         unsafe_allow_html=True,
     )
-    st.video(str(vpath))  # immediate
+    st.video(str(vpath))
 
     if not ok_ffmpeg:
-        st.warning("FFmpeg necessário")
+        st.warning("FFmpeg necessario")
         st.stop()
+
+    try:
+        require_api_key()
+        has_groq = True
+    except RuntimeError:
+        has_groq = False
+
+    if not has_groq and not st.session_state.prefer_local:
+        st.info("Sem chave Groq: marque IA local (CPU) ou configure a API key.")
 
     if st.button("Encontrar melhores momentos", type="primary", use_container_width=True):
         reset_analysis()
         status = st.status("Analisando…", expanded=True)
-        vhash = st.session_state.video_hash
         prefer = st.session_state.prefer_local
         n = int(st.session_state.top_n)
         try:
-            # Cache transcription
+            if not st.session_state.video_hash:
+                status.write("Calculando hash (cache)…")
+                t0 = time.time()
+                st.session_state.video_hash = file_sha256(vpath)
+                perf("Hash", time.time() - t0)
+            vhash = st.session_state.video_hash
+
             cached_tr = load_json(vhash, "transcription")
             if cached_tr:
-                status.write("Transcrição (cache)")
+                status.write("Transcricao (cache) — pulou etapa pesada")
                 tr = transcription_from_cache(cached_tr)
-                perf("Transcription(cache)", 0.0)
             else:
-                status.write("Etapa 1/3 · Transcrevendo (1x)")
+                status.write("Etapa 1/3 · Transcrevendo (Groq ou CPU — sem GPU)")
                 t0 = time.time()
                 tr, audio = transcribe_video(vpath, prefer_local=prefer)
                 cleanup_file(audio)
@@ -255,33 +250,30 @@ if vpath:
                 save_json(vhash, "transcription", transcription_to_cache(tr))
             st.session_state.transcription = tr
 
-            # Cache analysis for same n
             cache_key = f"analysis_n{n}_{'local' if prefer else 'groq'}"
             cached_an = load_json(vhash, cache_key)
             if cached_an and cached_an.get("candidates"):
-                status.write("Análise (cache)")
+                status.write("Analise (cache)")
                 cands = [ClipCandidate.from_dict(c) for c in cached_an["candidates"]]
-                perf("Analysis(cache)", 0.0)
             else:
-                status.write(f"Etapa 2/3 · IA · TOP {n} (1x)")
+                status.write(f"Etapa 2/3 · TOP {n}")
                 t0 = time.time()
                 cands = analyze_best_clips(tr, info.duration, n=n, prefer_local=prefer)
                 perf("Analysis", time.time() - t0)
                 save_json(vhash, cache_key, {"candidates": [c.to_dict() for c in cands]})
 
-            status.write("Etapa 3/3 · Thumbnails")
+            status.write("Etapa 3/3 · Thumbnails leves")
             t0 = time.time()
             for c in cands:
                 extract_thumbnail(vpath, c.start + min(2.0, c.duration / 3), vhash)
             perf("Thumbnails", time.time() - t0)
 
             st.session_state.candidates = cands
-            status.update(label=f"{len(cands)} momentos encontrados", state="complete")
+            status.update(label=f"{len(cands)} momentos", state="complete")
         except Exception as e:
             status.update(label="Erro", state="error")
             err(str(e))
 
-# ── Results grid ─────────────────────────────────────────
 if st.session_state.candidates:
     st.markdown('<div class="vc-section">Melhores clipes</div>', unsafe_allow_html=True)
     if st.session_state.perf_log:
@@ -290,33 +282,28 @@ if st.session_state.candidates:
     vhash = st.session_state.video_hash or "x"
     cols = st.columns(min(3, len(st.session_state.candidates)))
     for i, cand in enumerate(st.session_state.candidates):
-        col = cols[i % len(cols)]
-        with col:
+        with cols[i % len(cols)]:
             thumb = extract_thumbnail(
                 Path(st.session_state.video_path),
                 cand.start + min(2.0, cand.duration / 3),
                 vhash,
             )
-            if thumb.exists():
+            if thumb.exists() and thumb.stat().st_size > 100:
                 st.image(str(thumb), use_container_width=True)
             st.markdown(
                 f"**#{i+1}** · `{format_timestamp(cand.start)} → {format_timestamp(cand.end)}`  \n"
                 f"Score **{cand.score}** · {cand.duration:.0f}s  \n"
-                f"{cand.hook or cand.reason or cand.transcript_snip or '—'}"
+                f"{(cand.hook or cand.reason or cand.transcript_snip or '—')[:120]}"
             )
             b1, b2 = st.columns(2)
             if b1.button("Preview", key=f"pv_{i}", use_container_width=True):
                 st.session_state.selected_idx = i
             if b2.button("Editar", key=f"ed_{i}", use_container_width=True):
                 st.session_state.selected_idx = i
-                # cut once for editor
                 OUTPUT_DIR.mkdir(exist_ok=True)
                 out = OUTPUT_DIR / generate_output_filename(prefix=f"clip{i+1}")
-                with st.spinner("Cortando clipe…"):
-                    cut_video(
-                        Path(st.session_state.video_path),
-                        cand.start, cand.end, out, mode="fast",
-                    )
+                with st.spinner("Cortando…"):
+                    cut_video(Path(st.session_state.video_path), cand.start, cand.end, out, mode="fast")
                 st.session_state.clip_path = str(out)
                 meta = get_video_info(out)
                 tr = st.session_state.transcription
@@ -333,19 +320,14 @@ if st.session_state.candidates:
                 st.session_state.export_path = None
                 st.rerun()
 
-    # Interval preview without new MP4
     if st.session_state.selected_idx is not None:
         idx = int(st.session_state.selected_idx)
         if 0 <= idx < len(st.session_state.candidates):
             cand = st.session_state.candidates[idx]
             st.markdown(f"### Preview #{idx+1}")
-            st.caption("Reproduz só o intervalo no vídeo original (sem gerar MP4).")
-            # Streamlit cannot easily serve local file to components with path;
-            # use st.video + note start time for users; also try cut preview optional
-            st.info(f"Início sugerido: **{format_timestamp(cand.start)}** · fim **{format_timestamp(cand.end)}**")
+            st.info(f"{format_timestamp(cand.start)} → {format_timestamp(cand.end)}")
             st.video(str(st.session_state.video_path), start_time=int(cand.start))
 
-# ── Editor (existing, simplified entry) ──────────────────
 if st.session_state.editor_open and st.session_state.editor_history and st.session_state.clip_path:
     hist: HistoryStack = st.session_state.editor_history
     state = hist.current
@@ -359,7 +341,7 @@ if st.session_state.editor_open and st.session_state.editor_history and st.sessi
     if u2.button("Redo", disabled=not hist.can_redo()):
         hist.redo()
         st.rerun()
-    if u3.button("−1f"):
+    if u3.button("-1f"):
         hist.push(frame_step(state, -1))
         st.rerun()
     if u4.button("+1f"):
@@ -367,16 +349,12 @@ if st.session_state.editor_open and st.session_state.editor_history and st.sessi
         st.rerun()
 
     st.markdown(render_timeline_html(state), unsafe_allow_html=True)
-    ph = st.slider("Playhead", 0.0, max(0.01, state.timeline_duration), float(state.playhead), 0.04)
-    if abs(ph - state.playhead) > 1e-3:
-        hist.push(set_playhead(state, ph))
-        st.rerun()
-
     tools = ["Trim", "Split", "Crop", "Audio", "Captions", "Text", "Export"]
-    st.session_state.editor_tool = st.radio("Tool", tools, horizontal=True, label_visibility="collapsed",
-        index=tools.index(st.session_state.editor_tool) if st.session_state.editor_tool in tools else 0)
+    st.session_state.editor_tool = st.radio(
+        "Tool", tools, horizontal=True, label_visibility="collapsed",
+        index=tools.index(st.session_state.editor_tool) if st.session_state.editor_tool in tools else 0,
+    )
     tool = st.session_state.editor_tool
-
     left, right = st.columns([1.3, 1])
     with left:
         st.video(str(clip_p))
@@ -412,7 +390,7 @@ if st.session_state.editor_open and st.session_state.editor_history and st.sessi
             muted = st.checkbox("Mudo", state.audio.muted)
             fi = st.number_input("Fade in", 0.0, 5.0, float(state.audio.fade_in), 0.1)
             fo = st.number_input("Fade out", 0.0, 5.0, float(state.audio.fade_out), 0.1)
-            if st.button("Aplicar áudio"):
+            if st.button("Aplicar audio"):
                 s = state.clone()
                 s.audio = AudioSettings(vol, muted, fi, fo)
                 hist.push(s)
@@ -433,7 +411,7 @@ if st.session_state.editor_open and st.session_state.editor_history and st.sessi
                     hist.push(s)
                     st.rerun()
         elif tool == "Text":
-            tx = st.text_input("Texto", "TÍTULO")
+            tx = st.text_input("Texto", "TITULO")
             ty = st.slider("Y", 0.0, 1.0, 0.12)
             if st.button("Add texto"):
                 hist.push(add_text_overlay(state, tx, end=state.timeline_duration, y=ty))
@@ -448,9 +426,7 @@ if st.session_state.editor_open and st.session_state.editor_history and st.sessi
                     bar.progress(min(1.0, p), text=msg)
 
                 try:
-                    t0 = time.time()
                     run_export(hist.current, out, burn_captions=st.session_state.burn_captions, progress=cb)
-                    perf("Export", time.time() - t0)
                     st.session_state.export_path = str(out)
                     st.success("OK")
                 except Exception as e:
@@ -469,7 +445,8 @@ if st.session_state.editor_open and st.session_state.editor_history and st.sessi
                         ep, hist.current.timeline_duration,
                         segments=tr.segments if tr else [],
                         full_text=tr.text if tr else "",
-                        use_vision=True, max_frames=2,
+                        use_vision=False,
+                        max_frames=0,
                     )
                 except Exception as e:
                     err(str(e))
@@ -477,6 +454,5 @@ if st.session_state.editor_open and st.session_state.editor_history and st.sessi
         if pkg:
             st.write(pkg.context.summary)
             st.markdown(f"**{pkg.title.primary}**")
-            st.download_button("Textos", pkg.copy_all_text().encode(), "content.txt", use_container_width=True)
 
-st.caption("1× transcrição · 1× análise · cache por hash · MP4 só ao editar/exportar")
+st.caption("Padrao seguro: Groq na fala · sem GPU na etapa 1 · feche o Ollama se o PC travar")
