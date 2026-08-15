@@ -20,7 +20,6 @@ log = logging.getLogger("video_clipper.transcription")
 CHUNK_DURATION_SEC = 300.0
 FORCE_CHUNK_MB = 8.0
 
-# Prevent accidental CUDA use in this process (safer on RTX 2070 8GB + 16GB RAM)
 os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
 os.environ.setdefault("OMP_NUM_THREADS", "4")
 
@@ -64,8 +63,12 @@ def _parse_response(transcription: Any, time_offset: float = 0.0) -> Transcripti
         if t:
             segments.append(Segment(start=s + time_offset, end=e + time_offset, text=t))
     return TranscriptionResult(
-        text=text, segments=segments, language=language, duration=duration,
-        raw=transcription, source="groq",
+        text=text,
+        segments=segments,
+        language=language,
+        duration=duration,
+        raw=transcription,
+        source="groq",
     )
 
 
@@ -73,10 +76,6 @@ def transcribe_local_faster_whisper(
     audio_path: Path,
     language: Optional[str] = None,
 ) -> TranscriptionResult:
-    """
-    CPU-only local transcription — NEVER uses GPU.
-    Model: tiny/base int8 to protect 16GB RAM systems.
-    """
     try:
         from faster_whisper import WhisperModel
     except ImportError as exc:
@@ -84,11 +83,8 @@ def transcribe_local_faster_whisper(
             "Transcricao local indisponivel. Instale: python -m pip install faster-whisper"
         ) from exc
 
-    # Force CPU even if CUDA is installed
     os.environ["CUDA_VISIBLE_DEVICES"] = ""
-
     log.info("Local CPU transcription: %s", audio_path.name)
-    # tiny = lightest; base = better quality still OK on CPU
     model_name = os.environ.get("VIDEOCLIPPER_WHISPER_MODEL", "tiny")
     model = WhisperModel(
         model_name,
@@ -154,7 +150,7 @@ def _transcribe_single_file(
     except APIConnectionError as exc:
         raise RuntimeError("Falha de conexao com a API Groq.") from exc
     except APIError as exc:
-        raise RuntimeError(f"Erro da API Groq: {exc}") from exp if False else RuntimeError(f"Erro da API Groq: {exc}") from exc
+        raise RuntimeError(f"Erro da API Groq: {exc}") from exc
 
     return _parse_response(transcription, time_offset=time_offset)
 
