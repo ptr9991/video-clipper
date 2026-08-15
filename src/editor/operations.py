@@ -7,9 +7,9 @@ from pathlib import Path
 from typing import Optional
 
 from src.captions import (
-    DEFAULT_SHORTS,
     captions_from_segments_fallback,
     captions_from_words,
+    get_default_shorts,
 )
 from src.editor.caption_styles import style_by_name
 from src.editor.models import (
@@ -40,11 +40,10 @@ def new_project_from_clip(
         source_duration=dur,
         fps=fps if fps > 0 else 30.0,
         playable_range=TimelineRange(start=0.0, end=dur),
-        aspect=AspectRatio.VERTICAL_9_16,  # always 9:16
-        caption_style=DEFAULT_SHORTS,
+        aspect=AspectRatio.VERTICAL_9_16,
+        caption_style=get_default_shorts(),
     )
 
-    # Prefer word-level → relative → chunked captions
     if transcription and transcription.words:
         project.captions = captions_from_words(
             transcription.words, clip_start_abs, dur
@@ -143,9 +142,7 @@ def set_crop(state: ProjectState, crop: CropSettings) -> ProjectState:
 def set_caption_style(state: ProjectState, style_name: str) -> ProjectState:
     s = state.clone()
     if style_name in ("default_shorts", "shorts"):
-        from src.captions import DEFAULT_SHORTS
-
-        s.caption_style = DEFAULT_SHORTS
+        s.caption_style = get_default_shorts()
     else:
         s.caption_style = style_by_name(style_name)
     return s

@@ -1,15 +1,17 @@
 """
-Short-form caption pipeline: word-level timing, chunking, relative offset, safe zone.
+Short-form caption pipeline: word-level timing, chunking, relative offset.
+No top-level import from src.editor (avoids circular import).
 """
 
 from __future__ import annotations
 
 import re
 import uuid
-from dataclasses import dataclass, field
-from typing import Optional
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any, Optional
 
-from src.editor.models import CaptionCue, CaptionStyle
+if TYPE_CHECKING:
+    from src.editor.models import CaptionCue, CaptionStyle
 
 
 @dataclass
@@ -37,21 +39,29 @@ class WordStamp:
         )
 
 
-# 1080x1920 safe margins (do not burn into export)
 SAFE_ZONE = {
     "tiktok": {"top": 0.12, "bottom": 0.22, "left": 0.06, "right": 0.18},
     "instagram_reels": {"top": 0.10, "bottom": 0.20, "left": 0.06, "right": 0.14},
     "youtube_shorts": {"top": 0.10, "bottom": 0.18, "left": 0.06, "right": 0.12},
 }
 
-DEFAULT_SHORTS = CaptionStyle(
-    name="default_shorts",
-    font_size=64,
-    primary_color="#FFFFFF",
-    highlight_color="#C8F542",
-    outline=4,
-    margin_v=280,  # ASS bottom margin — above platform UI (~15% of 1920)
-)
+
+def get_default_shorts() -> Any:
+    from src.editor.models import CaptionStyle
+
+    return CaptionStyle(
+        name="default_shorts",
+        font_size=64,
+        primary_color="#FFFFFF",
+        highlight_color="#C8F542",
+        outline=4,
+        margin_v=280,
+    )
+
+
+# Back-compat alias used carefully (call get_default_shorts() in runtime code)
+def DEFAULT_SHORTS() -> Any:  # type: ignore
+    return get_default_shorts()
 
 
 def shift_words_to_clip(
@@ -59,11 +69,6 @@ def shift_words_to_clip(
     clip_start_abs: float,
     clip_duration: float,
 ) -> list[WordStamp]:
-    """
-    Convert absolute video times → relative to clip [0, duration].
-
-    Example: clip_start=42.35, word at 43.12 → 0.77
-    """
     out: list[WordStamp] = []
     for w in words:
         if w.end < clip_start_abs or w.start > clip_start_abs + clip_duration:
@@ -95,12 +100,13 @@ def chunk_words(
     max_words: int = 6,
     max_gap: float = 0.55,
     max_chars: int = 36,
-) -> list[CaptionCue]:
-    """Group words into readable 1–2 line caption blocks."""
+) -> list:
+    from src.editor.models import CaptionCue
+
     if not words:
         return []
 
-    cues: list[CaptionCue] = []
+    cues: list = []
     buf: list[WordStamp] = []
 
     def flush() -> None:
@@ -114,7 +120,6 @@ def chunk_words(
             return
         start = buf[0].start
         end = max(buf[-1].end, start + 0.35)
-        # min on-screen time for readability
         if end - start < 0.4:
             end = start + 0.4
         cues.append(
@@ -151,15 +156,14 @@ def chunk_words(
     return _fix_overlaps(cues)
 
 
-def _fix_overlaps(cues: list[CaptionCue]) -> list[CaptionCue]:
+def _fix_overlaps(cues: list) -> list:
     if not cues:
         return []
     fixed = [cues[0]]
     for c in cues[1:]:
         prev = fixed[-1]
         if c.start < prev.end:
-            # small gap between blocks
-            mid = (prev.end + c.start) / 2 if c.start < prev.end else c.start
+            mid = (prev.end + c.start) / 2
             prev.end = max(prev.start + 0.2, min(prev.end, mid))
             c.start = max(c.start, prev.end + 0.02)
             if c.end <= c.start:
@@ -174,7 +178,7 @@ def captions_from_words(
     words: list[WordStamp],
     clip_start_abs: float,
     clip_duration: float,
-) -> list[CaptionCue]:
+) -> list:
     rel = shift_words_to_clip(words, clip_start_abs, clip_duration)
     return chunk_words(rel)
 
@@ -183,8 +187,7 @@ def captions_from_segments_fallback(
     segments: list,
     clip_start_abs: float,
     clip_duration: float,
-) -> list[CaptionCue]:
-    """When word timestamps unavailable, split segment text evenly in time."""
+) -> list:
     words: list[WordStamp] = []
     for seg in segments:
         text = (getattr(seg, "text", "") or "").strip()
