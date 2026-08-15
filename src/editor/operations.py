@@ -6,6 +6,11 @@ import uuid
 from pathlib import Path
 from typing import Optional
 
+from src.captions import (
+    DEFAULT_SHORTS,
+    captions_from_segments_fallback,
+    captions_from_words,
+)
 from src.editor.caption_styles import style_by_name
 from src.editor.models import (
     AspectRatio,
@@ -15,7 +20,7 @@ from src.editor.models import (
     TextOverlay,
     TimelineRange,
 )
-from src.transcription import Segment
+from src.transcription import Segment, TranscriptionResult
 
 
 def new_project_from_clip(
@@ -25,6 +30,7 @@ def new_project_from_clip(
     name: str = "Clip",
     segments: Optional[list[Segment]] = None,
     clip_start_abs: float = 0.0,
+    transcription: Optional[TranscriptionResult] = None,
 ) -> ProjectState:
     path = str(source_path)
     dur = max(0.0, float(duration))
@@ -34,39 +40,26 @@ def new_project_from_clip(
         source_duration=dur,
         fps=fps if fps > 0 else 30.0,
         playable_range=TimelineRange(start=0.0, end=dur),
-        aspect=AspectRatio.VERTICAL_9_16,
+        aspect=AspectRatio.VERTICAL_9_16,  # always 9:16
+        caption_style=DEFAULT_SHORTS,
     )
-    if segments:
-        project.captions = captions_from_segments(segments, clip_start_abs, dur)
+
+    # Prefer word-level → relative → chunked captions
+    if transcription and transcription.words:
+        project.captions = captions_from_words(
+            transcription.words, clip_start_abs, dur
+        )
+    elif transcription and transcription.segments:
+        project.captions = captions_from_segments_fallback(
+            transcription.segments, clip_start_abs, dur
+        )
+    elif segments:
+        project.captions = captions_from_segments_fallback(
+            segments, clip_start_abs, dur
+        )
+
     project.validate()
     return project
-
-
-def captions_from_segments(
-    segments: list[Segment],
-    clip_start_abs: float,
-    clip_duration: float,
-) -> list[CaptionCue]:
-    cues: list[CaptionCue] = []
-    for i, seg in enumerate(segments):
-        if seg.end < clip_start_abs or seg.start > clip_start_abs + clip_duration:
-            continue
-        rel_s = max(0.0, seg.start - clip_start_abs)
-        rel_e = min(clip_duration, max(0.05, seg.end - clip_start_abs))
-        if rel_e <= rel_s:
-            continue
-        text = (seg.text or "").strip()
-        if not text:
-            continue
-        cues.append(
-            CaptionCue(
-                id=f"cap_{i}_{uuid.uuid4().hex[:6]}",
-                start=rel_s,
-                end=rel_e,
-                text=text,
-            )
-        )
-    return cues
 
 
 def apply_trim(state: ProjectState, start: float, end: float) -> ProjectState:
@@ -92,7 +85,6 @@ def apply_trim(state: ProjectState, start: float, end: float) -> ProjectState:
                 )
             )
     s.captions = new_caps
-    # texts
     new_texts: list[TextOverlay] = []
     for t in state.texts:
         abs_s = old.start + t.start
@@ -102,18 +94,18 @@ def apply_trim(state: ProjectState, start: float, end: float) -> ProjectState:
         rel_s = max(0.0, abs_s - new_start)
         rel_e = min(s.timeline_duration, abs_e - new_start)
         if rel_e > rel_s:
-            nt = TextOverlay(
-                id=t.id, text=t.text, start=rel_s, end=rel_e,
-                x=t.x, y=t.y, font_size=t.font_size, color=t.color,
+            new_texts.append(
+                TextOverlay(
+                    id=t.id, text=t.text, start=rel_s, end=rel_e,
+                    x=t.x, y=t.y, font_size=t.font_size, color=t.color,
+                )
             )
-            new_texts.append(nt)
     s.texts = new_texts
     s.validate()
     return s
 
 
 def apply_split_keep_left(state: ProjectState, at: float) -> ProjectState:
-    """Keep left part of timeline at playhead `at`."""
     at = max(0.05, min(at, state.timeline_duration - 0.05))
     abs_at = state.playable_range.start + at
     return apply_trim(state, state.playable_range.start, abs_at)
@@ -125,7 +117,7 @@ def apply_split_keep_right(state: ProjectState, at: float) -> ProjectState:
     return apply_trim(state, abs_at, state.playable_range.end)
 
 
-def apply_split(state: ProjectState, at: float) -> tuple[ProjectState, ProjectState]:
+def apply_split(state: ProjectState, at: float):
     at = max(0.0, min(at, state.timeline_duration))
     abs_at = state.playable_range.start + at
     left = apply_trim(state, state.playable_range.start, abs_at)
@@ -150,7 +142,12 @@ def set_crop(state: ProjectState, crop: CropSettings) -> ProjectState:
 
 def set_caption_style(state: ProjectState, style_name: str) -> ProjectState:
     s = state.clone()
-    s.caption_style = style_by_name(style_name)
+    if style_name in ("default_shorts", "shorts"):
+        from src.captions import DEFAULT_SHORTS
+
+        s.caption_style = DEFAULT_SHORTS
+    else:
+        s.caption_style = style_by_name(style_name)
     return s
 
 

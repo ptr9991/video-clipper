@@ -65,8 +65,7 @@ def _parse_response(transcription: Any, time_offset: float = 0.0) -> Transcripti
             segments.append(Segment(start=s + time_offset, end=e + time_offset, text=t))
 
     words: list[WordStamp] = []
-    raw_words = getattr(transcription, "words", None) or []
-    for w in raw_words:
+    for w in getattr(transcription, "words", None) or []:
         if isinstance(w, dict):
             ww = str(w.get("word", "")).strip()
             ws = float(w.get("start", 0))
@@ -79,7 +78,12 @@ def _parse_response(transcription: Any, time_offset: float = 0.0) -> Transcripti
             conf = float(getattr(w, "probability", getattr(w, "confidence", 1.0)) or 1.0)
         if ww:
             words.append(
-                WordStamp(word=ww, start=ws + time_offset, end=we + time_offset, confidence=conf)
+                WordStamp(
+                    word=ww,
+                    start=ws + time_offset,
+                    end=we + time_offset,
+                    confidence=conf,
+                )
             )
 
     return TranscriptionResult(
@@ -100,9 +104,7 @@ def transcribe_local_faster_whisper(
     try:
         from faster_whisper import WhisperModel
     except ImportError as exc:
-        raise RuntimeError(
-            "Transcricao local indisponivel. pip install faster-whisper"
-        ) from exc
+        raise RuntimeError("pip install faster-whisper") from exc
 
     os.environ["CUDA_VISIBLE_DEVICES"] = ""
     model_name = os.environ.get("VIDEOCLIPPER_WHISPER_MODEL", "tiny")
@@ -128,16 +130,15 @@ def transcribe_local_faster_whisper(
             parts.append(t)
         for w in getattr(seg, "words", None) or []:
             ww = (getattr(w, "word", "") or "").strip()
-            if not ww:
-                continue
-            words.append(
-                WordStamp(
-                    word=ww,
-                    start=float(w.start),
-                    end=float(w.end),
-                    confidence=float(getattr(w, "probability", 1.0) or 1.0),
+            if ww:
+                words.append(
+                    WordStamp(
+                        word=ww,
+                        start=float(w.start),
+                        end=float(w.end),
+                        confidence=float(getattr(w, "probability", 1.0) or 1.0),
+                    )
                 )
-            )
 
     return TranscriptionResult(
         text=" ".join(parts),
@@ -160,40 +161,32 @@ def _transcribe_single_file(
     if size_mb > GROQ_SAFE_UPLOAD_MB:
         raise RuntimeError(f"Chunk grande demais ({size_mb:.1f} MB).")
 
-    try:
+    def _call(granularities: list[str]) -> Any:
         with audio_path.open("rb") as audio_file:
             kwargs: dict[str, Any] = {
                 "file": (audio_path.name, audio_file.read()),
                 "model": model,
                 "response_format": "verbose_json",
-                # word + segment for professional short-form captions
-                "timestamp_granularities": ["word", "segment"],
+                "timestamp_granularities": granularities,
             }
             if language:
                 kwargs["language"] = language
-            transcription = client.audio.transcriptions.create(**kwargs)
-    except AuthenticationError as exc:
-        raise RuntimeError("Chave Groq invalida.") from exp if False else RuntimeError("Chave Groq invalida.") from exp if False else None
+            return client.audio.transcriptions.create(**kwargs)
 
+    try:
+        transcription = _call(["word", "segment"])
     except AuthenticationError as exc:
-        raise RuntimeError("Chave Groq invalida.") from exp if False else RuntimeError("Chave Groq invalida.") from exc
+        raise RuntimeError("Chave Groq invalida.") from exc
     except RateLimitError:
         raise
     except APIConnectionError as exc:
         raise RuntimeError("Falha de conexao Groq.") from exc
     except APIError as exc:
-        # fallback without word granularity
-        log.warning("word timestamps failed, retry segment-only: %s", exc)
-        with audio_path.open("rb") as audio_file:
-            kwargs = {
-                "file": (audio_path.name, audio_file.read()),
-                "model": model,
-                "response_format": "verbose_json",
-                "timestamp_granularities": ["segment"],
-            }
-            if language:
-                kwargs["language"] = language
-            transcription = client.audio.transcriptions.create(**kwargs)
+        log.warning("word timestamps unavailable, segment-only: %s", exc)
+        try:
+            transcription = _call(["segment"])
+        except Exception as exc2:
+            raise RuntimeError(f"Erro da API Groq: {exc2}") from exc2
 
     return _parse_response(transcription, time_offset=time_offset)
 
@@ -263,7 +256,8 @@ def transcribe_video(
 ) -> tuple[TranscriptionResult, Path]:
     audio_path = extract_audio(video_path)
     try:
-        return transcribe_audio(audio_path, language=language, prefer_local=prefer_local), audio_path
+        result = transcribe_audio(audio_path, language=language, prefer_local=prefer_local)
+        return result, audio_path
     except Exception:
         cleanup_file(audio_path)
         raise
