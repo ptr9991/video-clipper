@@ -1,17 +1,13 @@
-"""
-Short-form caption pipeline: word-level timing, chunking, relative offset.
-No top-level import from src.editor (avoids circular import).
-"""
+"""Caption pipeline — VideoClipper Default only. Word-level, relative, max 2 lines."""
 
 from __future__ import annotations
 
 import re
 import uuid
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Optional
+from typing import Any
 
-if TYPE_CHECKING:
-    from src.editor.models import CaptionCue, CaptionStyle
+from src.preset import DEFAULT, balance_two_lines
 
 
 @dataclass
@@ -39,29 +35,17 @@ class WordStamp:
         )
 
 
-SAFE_ZONE = {
-    "tiktok": {"top": 0.12, "bottom": 0.22, "left": 0.06, "right": 0.18},
-    "instagram_reels": {"top": 0.10, "bottom": 0.20, "left": 0.06, "right": 0.14},
-    "youtube_shorts": {"top": 0.10, "bottom": 0.18, "left": 0.06, "right": 0.12},
-}
-
-
 def get_default_shorts() -> Any:
     from src.editor.models import CaptionStyle
 
     return CaptionStyle(
-        name="default_shorts",
-        font_size=64,
-        primary_color="#FFFFFF",
+        name="videoclipper_default",
+        font_size=DEFAULT.font_size,
+        primary_color=DEFAULT.primary_color,
         highlight_color="#C8F542",
-        outline=4,
-        margin_v=280,
+        outline=DEFAULT.outline,
+        margin_v=DEFAULT.margin_v,
     )
-
-
-# Back-compat alias used carefully (call get_default_shorts() in runtime code)
-def DEFAULT_SHORTS() -> Any:  # type: ignore
-    return get_default_shorts()
 
 
 def shift_words_to_clip(
@@ -77,6 +61,8 @@ def shift_words_to_clip(
         re_ = min(clip_duration, max(rs + 0.02, w.end - clip_start_abs))
         if re_ <= rs:
             continue
+        text = re.sub(r"\s+", "", (w.word or "")).strip() or (w.word or "").strip()
+        # keep internal spaces for multi-token rare cases
         text = (w.word or "").strip()
         if not text:
             continue
@@ -84,24 +70,23 @@ def shift_words_to_clip(
     return out
 
 
-def _should_break(prev: str, nxt: str) -> bool:
-    if not prev:
-        return False
-    if prev[-1] in ".!?…":
-        return True
-    if prev[-1] in ",;:" and len(prev) > 12:
-        return True
-    return False
+def _clean_word(w: str) -> str:
+    return re.sub(r"\s+", " ", (w or "")).strip()
 
 
 def chunk_words(
     words: list[WordStamp],
-    min_words: int = 2,
-    max_words: int = 6,
-    max_gap: float = 0.55,
-    max_chars: int = 36,
+    min_words: int | None = None,
+    max_words: int | None = None,
+    max_gap: float | None = None,
+    max_chars: int | None = None,
 ) -> list:
     from src.editor.models import CaptionCue
+
+    min_words = min_words if min_words is not None else DEFAULT.min_words
+    max_words = max_words if max_words is not None else DEFAULT.max_words
+    max_gap = max_gap if max_gap is not None else 0.50
+    max_chars = max_chars if max_chars is not None else DEFAULT.max_chars_line * 2
 
     if not words:
         return []
@@ -113,21 +98,22 @@ def chunk_words(
         nonlocal buf
         if not buf:
             return
-        text = " ".join(w.word for w in buf).strip()
-        text = re.sub(r"\s+", " ", text)
-        if not text:
+        toks = [_clean_word(w.word) for w in buf if _clean_word(w.word)]
+        if not toks:
             buf = []
             return
+        text = balance_two_lines(toks, max_chars=DEFAULT.max_chars_line)
         start = buf[0].start
-        end = max(buf[-1].end, start + 0.35)
-        if end - start < 0.4:
-            end = start + 0.4
+        end = max(buf[-1].end, start + DEFAULT.min_words * 0.15)
+        # min readable duration
+        if end - start < 0.45:
+            end = start + 0.45
         cues.append(
             CaptionCue(
                 id=f"cap_{uuid.uuid4().hex[:8]}",
                 start=start,
                 end=end,
-                text=text.upper(),
+                text=text,
                 highlight_words=[],
             )
         )
@@ -138,14 +124,15 @@ def chunk_words(
             buf = [w]
             continue
         gap = w.start - buf[-1].end
-        joined = " ".join(x.word for x in buf) + " " + w.word
+        joined_len = sum(len(_clean_word(x.word)) + 1 for x in buf) + len(_clean_word(w.word))
+        punct_break = _clean_word(buf[-1].word)[-1:] in ".!?…"
         if (
             gap > max_gap
             or len(buf) >= max_words
-            or len(joined) > max_chars
-            or _should_break(buf[-1].word, w.word)
+            or joined_len > max_chars
+            or punct_break
         ):
-            if len(buf) >= min_words or gap > max_gap:
+            if len(buf) >= min_words or gap > max_gap or punct_break:
                 flush()
                 buf = [w]
             else:
@@ -164,10 +151,10 @@ def _fix_overlaps(cues: list) -> list:
         prev = fixed[-1]
         if c.start < prev.end:
             mid = (prev.end + c.start) / 2
-            prev.end = max(prev.start + 0.2, min(prev.end, mid))
+            prev.end = max(prev.start + 0.25, min(prev.end, mid))
             c.start = max(c.start, prev.end + 0.02)
             if c.end <= c.start:
-                c.end = c.start + 0.35
+                c.end = c.start + 0.45
         if c.end <= c.start:
             continue
         fixed.append(c)
