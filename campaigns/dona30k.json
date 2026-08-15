@@ -1,0 +1,60 @@
+{
+  "campaign_id": "dona30k",
+  "name": "Campeonato Dona 30K",
+  "hashtag": "#dona30K",
+  "official_handle": "",
+  "twitch_url": "https://www.twitch.tv/dona",
+  "twitch_display": "Twitch.tv/dona",
+  "start_date": "2026-08-16",
+  "end_date": "2026-09-15T23:59:00",
+  "ranking_date": "2026-09-17T12:00:00",
+  "platforms": ["tiktok", "instagram", "youtube_shorts", "facebook"],
+  "required_in_video": ["twitch_cta"],
+  "required_in_title": ["hashtag"],
+  "required_in_caption": ["hashtag", "official_handle"],
+  "canvas": {"width": 1080, "height": 1920, "aspect": "9:16"},
+  "cta": {
+    "text": "Twitch.tv/dona",
+    "position": "top_left",
+    "x": 0.08,
+    "y": 0.06,
+    "font_size": 28,
+    "color": "#FFFFFF",
+    "full_duration": true
+  },
+  "prizes": [
+    {"rank": 1, "amount": "R$ 10.000"},
+    {"rank": 2, "amount": "R$ 6.000"},
+    {"rank": 3, "amount": "R$ 4.000"},
+    {"rank": 4, "amount": "R$ 3.000"},
+    {"rank": 5, "amount": "R$ 2.000"},
+    {"rank": 6, "amount": "R$ 1.500"},
+    {"rank": 7, "amount": "R$ 1.200"},
+    {"rank": 8, "amount": "R$ 1.000"},
+    {"rank": 9, "amount": "R$ 800"},
+    {"rank": 10, "amount": "R$ 500"}
+  ],
+  "rules_required": [
+    "Usar #dona30K no título do vídeo",
+    "Marcar o @ oficial do Dona",
+    "Divulgar https://www.twitch.tv/dona DENTRO do vídeo",
+    "Participar do grupo oficial do WhatsApp",
+    "Publicar em Instagram, TikTok, YouTube e/ou Facebook"
+  ],
+  "rules_forbidden": [
+    "Comprar engajamento ou views",
+    "Fake react",
+    "Collab entre contas",
+    "Links de afiliados de terceiros",
+    "Baixar cortes de outros participantes",
+    "Repostar cortes antigos sem mudança significativa",
+    "Usar exclusivamente plataformas de IA tipo Opus Clip",
+    "Volume artificial de publicações para inflar views",
+    "Conteúdo fora de contexto"
+  ],
+  "warnings": [
+    "Conteúdos fora de contexto podem gerar desclassificação.",
+    "O participante é responsável pela publicação e pelo cumprimento do regulamento.",
+    "VideoClipper é editor/assistente — não automatiza postagem nem engajamento."
+  ]
+}
